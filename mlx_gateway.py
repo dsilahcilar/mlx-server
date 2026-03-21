@@ -49,9 +49,62 @@ def find_mlx_server_bin() -> str | None:
     return None
 
 
+def find_embedding_python() -> str | None:
+    """Find Python with sentence-transformers installed (shares mlx-lm venv)."""
+    candidates = [
+        Path.home() / ".local" / "pipx" / "venvs" / "mlx-lm" / "bin" / "python",
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    # Fall back to system python3 if sentence-transformers is installed there
+    import subprocess as _sp
+    for py in ("python3", "python"):
+        result = _sp.run(
+            [py, "-c", "import sentence_transformers"],
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            return shutil.which(py)
+    return None
+
+
 def is_model_cached(model_id: str) -> bool:
     cache_dir = HF_CACHE / f"models--{model_id.replace('/', '--')}"
     return cache_dir.is_dir()
+
+
+def is_embedding_model(model_id: str) -> bool:
+    """Return True if model_id is an embedding model (not a generative LLM)."""
+    # Check the HF cache for sentence-transformers marker files
+    cache_dir = HF_CACHE / f"models--{model_id.replace('/', '--')}"
+    if cache_dir.exists():
+        for snapshot in (cache_dir / "snapshots").iterdir() if (cache_dir / "snapshots").exists() else []:
+            if (snapshot / "modules.json").exists():
+                return True
+            if (snapshot / "sentence_bert_config.json").exists():
+                return True
+            if (snapshot / "1_Pooling").exists():
+                return True
+            # Check config.json for non-generative architectures
+            config_path = snapshot / "config.json"
+            if config_path.exists():
+                try:
+                    cfg = json.loads(config_path.read_text())
+                    arch = cfg.get("architectures", [""])[0]
+                    # Generative models end in ForCausalLM, ForConditionalGeneration, etc.
+                    if arch and not any(
+                        kw in arch for kw in ("CausalLM", "ConditionalGeneration", "LMHead", "Seq2SeqLM")
+                    ):
+                        return True
+                except Exception:
+                    pass
+    # Name heuristics for uncached models
+    lower = model_id.lower()
+    return any(kw in lower for kw in (
+        "embed", "minilm", "e5-", "bge-", "gte-",
+        "nomic-embed", "all-mpnet", "instructor-",
+    ))
 
 
 def get_cached_models() -> list[dict]:
@@ -151,13 +204,15 @@ def resolve_model(name: str) -> str:
 # ── Model Backend ─────────────────────────────────────────────────────────────
 
 class ModelBackend:
-    """Manages a single mlx_lm.server process serving one model."""
+    """Manages a single model server process (LLM or embedding)."""
 
     def __init__(self, model_id: str, port: int,
-                 max_tokens: int = MAX_TOKENS_DEFAULT):
+                 max_tokens: int = MAX_TOKENS_DEFAULT,
+                 embedding: bool = False):
         self.model_id = model_id
         self.port = port
         self.max_tokens = max_tokens
+        self.embedding = embedding  # True → use embedding server
         self.process: subprocess.Popen | None = None
         self.ready = False
         self.failed = False
@@ -172,13 +227,6 @@ class ModelBackend:
             return True
         self._loading.set()
 
-        mlx_bin = find_mlx_server_bin()
-        if not mlx_bin:
-            self.error = "mlx_lm.server not found. Install: pipx install mlx-lm"
-            self.failed = True
-            self._loading.clear()
-            return False
-
         if not is_model_cached(self.model_id):
             self.error = (
                 f"Model not found locally. Run: mlx-server pull {self.model_id}"
@@ -188,15 +236,37 @@ class ModelBackend:
             return False
 
         log_path = MLX_HOME / f"backend-{self.port}.log"
-        cmd = [
-            mlx_bin,
-            "--model", self.model_id,
-            "--port", str(self.port),
-            "--max-tokens", str(self.max_tokens),
-            "--chat-template-args", json.dumps({"enable_thinking": False}),
-        ]
 
-        log.info("Starting %s on internal port %d", self.model_id, self.port)
+        if self.embedding:
+            # Embedding backend: use mlx_embedding_server.py via the pipx python
+            embed_python = find_embedding_python()
+            if not embed_python:
+                self.error = (
+                    "sentence-transformers not found. "
+                    "Run: python -m pip install sentence-transformers"
+                )
+                self.failed = True
+                self._loading.clear()
+                return False
+            embed_script = Path(__file__).parent / "mlx_embedding_server.py"
+            cmd = [embed_python, str(embed_script), self.model_id, str(self.port)]
+        else:
+            mlx_bin = find_mlx_server_bin()
+            if not mlx_bin:
+                self.error = "mlx_lm.server not found. Install: pipx install mlx-lm"
+                self.failed = True
+                self._loading.clear()
+                return False
+            cmd = [
+                mlx_bin,
+                "--model", self.model_id,
+                "--port", str(self.port),
+                "--max-tokens", str(self.max_tokens),
+                "--chat-template-args", json.dumps({"enable_thinking": False}),
+            ]
+
+        log.info("Starting %s%s on internal port %d",
+                 self.model_id, " (embedding)" if self.embedding else "", self.port)
 
         try:
             self.process = subprocess.Popen(
@@ -320,7 +390,8 @@ class BackendManager:
                     )
                 port = self._next_port
                 self._next_port += 1
-                self.backends[model_id] = ModelBackend(model_id, port)
+                embedding = is_embedding_model(model_id)
+                self.backends[model_id] = ModelBackend(model_id, port, embedding=embedding)
 
         # If another thread is loading, wait for it
         if waiting_on is not None:
@@ -365,6 +436,7 @@ class BackendManager:
                     "ready": b.ready,
                     "loading": b.is_loading,
                     "failed": b.failed,
+                    "type": "embedding" if b.embedding else "llm",
                 }
                 if b.failed and b.error:
                     info["error"] = b.error

@@ -171,8 +171,27 @@ sys.exit(1)
       echo ""
       echo "✅ ${model} ready"
       echo ""
-      # Start interactive chat
-      python3 "${GATEWAY_SCRIPT}" chat "${GATEWAY_URL}" "${model}"
+      # Check model type - embedding models don't have a chat REPL
+      local model_type
+      model_type=$(python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+for m in data.get('models', []):
+    if m['model'] == sys.argv[1]:
+        print(m.get('type', 'llm'))
+        sys.exit(0)
+print('llm')
+" "${model}" <<< "${ps_resp}" 2>/dev/null)
+      if [[ "${model_type}" == "embedding" ]]; then
+        echo "Embedding model loaded. Use POST /v1/embeddings to generate embeddings."
+        echo "Example:"
+        echo "  curl http://127.0.0.1:11070/v1/embeddings \\"
+        echo "    -H 'Content-Type: application/json' \\"
+        echo "    -d '{\"model\":\"${model}\",\"input\":\"Your text here\"}'"
+      else
+        # Start interactive chat
+        python3 "${GATEWAY_SCRIPT}" chat "${GATEWAY_URL}" "${model}"
+      fi
       return 0
     fi
     sleep 3
@@ -327,20 +346,23 @@ if not models:
     print('No models loaded.')
     sys.exit(0)
 
-print(f\"{'NAME':<50}  {'SIZE':>6}  {'STATUS':<12}  IDLE\")
-print(f\"{'-'*50}  {'-'*6}  {'-'*12}  {'-'*6}\")
+print(f\"{'NAME':<50}  {'TYPE':<10}  {'SIZE':>6}  {'STATUS':<12}  IDLE\")
+print(f\"{'-'*50}  {'-'*10}  {'-'*6}  {'-'*12}  {'-'*6}\")
 
 for m in models:
     name = m['model']
+    mtype = m.get('type', 'llm')
     size = f\"{m.get('size_gb', 0):.0f}GB\" if m.get('size_gb') else '-'
     if m.get('ready'):
         status = '✅ running'
     elif m.get('loading'):
         status = '⏳ loading'
+    elif m.get('failed'):
+        status = '❌ failed'
     else:
         status = '❌ error'
     idle = m.get('idle', '-')
-    print(f'{name:<50}  {size:>6}  {status:<12}  {idle}')
+    print(f'{name:<50}  {mtype:<10}  {size:>6}  {status:<12}  {idle}')
 " <<< "${resp}"
 }
 

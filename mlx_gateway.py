@@ -160,6 +160,7 @@ class ModelBackend:
         self.max_tokens = max_tokens
         self.process: subprocess.Popen | None = None
         self.ready = False
+        self.failed = False
         self._loading = threading.Event()
         self._ready_event = threading.Event()
         self.last_used = time.time()
@@ -174,6 +175,7 @@ class ModelBackend:
         mlx_bin = find_mlx_server_bin()
         if not mlx_bin:
             self.error = "mlx_lm.server not found. Install: pipx install mlx-lm"
+            self.failed = True
             self._loading.clear()
             return False
 
@@ -181,6 +183,7 @@ class ModelBackend:
             self.error = (
                 f"Model not found locally. Run: mlx-server pull {self.model_id}"
             )
+            self.failed = True
             self._loading.clear()
             return False
 
@@ -204,15 +207,29 @@ class ModelBackend:
             )
         except Exception as exc:
             self.error = str(exc)
+            self.failed = True
             self._loading.clear()
             return False
 
         # Poll for readiness (up to 5 minutes)
         for _ in range(100):
             if self.process.poll() is not None:
-                self.error = (
-                    f"Process exited with code {self.process.returncode}"
-                )
+                # Read last few lines of log for a helpful error message
+                try:
+                    log_lines = log_path.read_text().strip().splitlines()
+                    # Find the most informative error line
+                    detail = next(
+                        (l.strip() for l in reversed(log_lines)
+                         if any(kw in l for kw in ("Error:", "error:", "Exception:", "Traceback"))),
+                        None
+                    ) or next(
+                        (l.strip() for l in reversed(log_lines) if l.strip()),
+                        f"exited with code {self.process.returncode}"
+                    )
+                except Exception:
+                    detail = f"exited with code {self.process.returncode}"
+                self.error = detail
+                self.failed = True
                 self._loading.clear()
                 log.error("Backend %s failed: %s", self.model_id, self.error)
                 return False
@@ -239,6 +256,7 @@ class ModelBackend:
             time.sleep(3)
 
         self.error = "Timeout (5 min) loading model"
+        self.failed = True
         self._loading.clear()
         log.error("Backend %s timed out", self.model_id)
         return False
@@ -288,11 +306,11 @@ class BackendManager:
                 if b.ready:
                     b.touch()
                     return b, None
-                if b.is_loading:
-                    waiting_on = b
-                else:
-                    # Previous failure — remove and recreate
+                if b.failed:
+                    # Previous failure — remove stale entry and recreate below
                     del self.backends[model_id]
+                elif b.is_loading:
+                    waiting_on = b
 
             if model_id not in self.backends and waiting_on is None:
                 if not is_model_cached(model_id):
@@ -319,10 +337,8 @@ class BackendManager:
         if backend.start():
             return backend, None
 
-        error = backend.error
-        with self._lock:
-            self.backends.pop(model_id, None)
-        return None, error or "Failed to start model"
+        # Keep failed backend in registry so CLI can see the error
+        return None, backend.error or "Failed to start model"
 
     def stop_model(self, model_id: str) -> bool:
         with self._lock:
@@ -348,7 +364,10 @@ class BackendManager:
                     "port": b.port,
                     "ready": b.ready,
                     "loading": b.is_loading,
+                    "failed": b.failed,
                 }
+                if b.failed and b.error:
+                    info["error"] = b.error
                 if b.process and b.process.poll() is None:
                     info["pid"] = b.process.pid
                 if b.ready:

@@ -141,6 +141,25 @@ cmd_run() {
   for _ in $(seq 1 200); do
     local ps_resp
     ps_resp=$(_api GET "/_/ps") || { sleep 3; echo -n "."; continue; }
+    # Check for failure first
+    local failed_err
+    failed_err=$(python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+for m in data.get('models', []):
+    if m['model'] == sys.argv[1] and m.get('failed'):
+        print(m.get('error', 'Unknown error'))
+        sys.exit(0)
+sys.exit(1)
+" "${model}" <<< "${ps_resp}" 2>/dev/null) && {
+      echo ""
+      echo "❌ Failed to load ${model}:" >&2
+      echo "   ${failed_err}" >&2
+      echo ""
+      echo "Tip: This model may not be a text-generation model supported by mlx_lm." >&2
+      echo "     Check: mlx-server logs" >&2
+      exit 1
+    }
     if python3 -c "
 import json, sys
 data = json.loads(sys.stdin.read())

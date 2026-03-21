@@ -12,12 +12,14 @@ import http.server
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -71,6 +73,79 @@ def get_cached_models() -> list[dict]:
                 "modified": d.stat().st_mtime,
             })
     return models
+
+
+# ── Model Aliases ─────────────────────────────────────────────────────────────
+
+def _generate_ollama_alias(model_id: str) -> str | None:
+    """Generate an Ollama-style alias (e.g., qwen3:8b) from an HF model ID."""
+    name = model_id.split("/")[-1] if "/" in model_id else model_id
+
+    # Strip quantization/format suffixes
+    name = re.sub(
+        r'[-_](4bit|8bit|6bit|MLX|mlx|qat|MXFP4|Q8|bf16|fp16|fp32)$',
+        '', name,
+    )
+    name = re.sub(
+        r'[-_](4bit|8bit|6bit|MLX|mlx|qat|MXFP4|Q8|bf16|fp16|fp32)$',
+        '', name,
+    )
+    # Strip instruction-tuning suffixes
+    name = re.sub(
+        r'[-_](Instruct|instruct|Chat|chat|it|IT|Base|base|Preview|preview)$',
+        '', name,
+    )
+
+    # Find model size pattern: 8B, 32B, 1.7B, 0.6B, etc.
+    size_match = re.search(r'[-_](\d+(?:\.\d+)?[Bb])(?:[-_]|$)', name)
+    if not size_match:
+        return None
+
+    size = size_match.group(1).lower()
+    family = name[:size_match.start()].rstrip('-_').lower()
+
+    return f"{family}:{size}" if family else None
+
+
+def build_alias_map() -> dict[str, str]:
+    """Build a map from alias names to full HuggingFace model IDs."""
+    aliases: dict[str, str] = {}
+
+    # Load custom aliases from ~/.mlx/aliases.json
+    alias_file = MLX_HOME / "aliases.json"
+    if alias_file.exists():
+        try:
+            aliases.update(json.loads(alias_file.read_text()))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Auto-generate aliases from cached models
+    for model in get_cached_models():
+        mid = model["id"]
+        aliases[mid] = mid  # Full name always works
+
+        # Short name: "Qwen3-8B-4bit"
+        if "/" in mid:
+            short = mid.split("/", 1)[1]
+            aliases.setdefault(short, mid)
+            aliases.setdefault(short.lower(), mid)
+
+        # Ollama-style: "qwen3:8b"
+        ollama = _generate_ollama_alias(mid)
+        if ollama:
+            aliases.setdefault(ollama, mid)
+
+    return aliases
+
+
+def resolve_model(name: str) -> str:
+    """Resolve a model alias to its full HuggingFace ID."""
+    aliases = build_alias_map()
+    if name in aliases:
+        return aliases[name]
+    if name.lower() in aliases:
+        return aliases[name.lower()]
+    return name  # Return as-is; let backend fail with clear error
 
 
 # ── Model Backend ─────────────────────────────────────────────────────────────
@@ -319,6 +394,15 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             self._json(200, {"models": manager.list_loaded()})
         elif self.path == "/_/health":
             self._json(200, {"status": "ok"})
+        # ── Ollama API ────────────────────────────────────────────────────
+        elif self.path == "/":
+            self._json(200, {"status": "mlx-server is running"})
+        elif self.path == "/api/tags":
+            self._ollama_tags()
+        elif self.path == "/api/ps":
+            self._ollama_ps()
+        elif self.path == "/api/version":
+            self._json(200, {"version": "mlx-server-1.0"})
         else:
             self._json(404, self._error("Not found"))
 
@@ -333,6 +417,13 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             self._handle_load()
         elif self.path == "/_/unload":
             self._handle_unload()
+        # ── Ollama API ────────────────────────────────────────────────────
+        elif self.path == "/api/chat":
+            self._ollama_chat()
+        elif self.path == "/api/generate":
+            self._ollama_generate()
+        elif self.path == "/api/show":
+            self._ollama_show()
         else:
             self._json(404, self._error("Not found"))
 
@@ -400,6 +491,8 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             self._json(400, self._error("'model' field is required"))
             return
 
+        model_id = resolve_model(model_id)
+        body["model"] = model_id  # Ensure backend gets the resolved name
         backend, err = manager.get_or_start(model_id)
         if not backend:
             self._json(
@@ -410,14 +503,15 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         is_stream = body.get("stream", False)
 
         try:
+            forwarded = json.dumps(body).encode()
             conn = http.client.HTTPConnection(
                 "127.0.0.1", backend.port, timeout=300
             )
             conn.request(
-                "POST", self.path, body=raw,
+                "POST", self.path, body=forwarded,
                 headers={
                     "Content-Type": "application/json",
-                    "Content-Length": str(len(raw)),
+                    "Content-Length": str(len(forwarded)),
                 },
             )
             resp = conn.getresponse()
@@ -475,6 +569,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         if not model_id:
             self._json(400, self._error("'model' field required"))
             return
+        model_id = resolve_model(model_id)
 
         def _load():
             _, err = manager.get_or_start(model_id)
@@ -496,6 +591,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         if not model_id:
             self._json(400, self._error("'model' field required"))
             return
+        model_id = resolve_model(model_id)
 
         if manager.stop_model(model_id):
             self._json(200, {"status": "stopped", "model": model_id})
@@ -503,6 +599,447 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             self._json(
                 404, self._error(f"Model '{model_id}' is not loaded")
             )
+
+    # ── Ollama API ────────────────────────────────────────────────────────
+
+    def _ollama_model_entry(self, model: dict) -> dict:
+        """Build an Ollama-style model entry for /api/tags."""
+        mid = model["id"]
+        alias = _generate_ollama_alias(mid) or mid
+        ts = datetime.fromtimestamp(
+            model["modified"], tz=timezone.utc
+        ).isoformat()
+
+        # Parse config for details
+        details = {"format": "mlx", "family": "", "parameter_size": "",
+                    "quantization_level": ""}
+        cache_dir = HF_CACHE / f"models--{mid.replace('/', '--')}"
+        config_files = list(cache_dir.glob("snapshots/*/config.json"))
+        if config_files:
+            try:
+                cfg = json.loads(config_files[0].read_text())
+                details["family"] = cfg.get("model_type", "")
+                quant = cfg.get("quantization", {})
+                if isinstance(quant, dict):
+                    details["quantization_level"] = (
+                        f"Q{quant.get('bits', '?')}"
+                    )
+                size_match = re.search(
+                    r'(\d+(?:\.\d+)?[Bb])', mid.split("/")[-1]
+                )
+                if size_match:
+                    details["parameter_size"] = size_match.group(1)
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        return {
+            "name": alias,
+            "model": alias,
+            "modified_at": ts,
+            "size": model["size_bytes"],
+            "digest": f"sha256:{mid}",
+            "details": details,
+        }
+
+    def _ollama_tags(self):
+        """GET /api/tags — list models in Ollama format."""
+        models = [
+            self._ollama_model_entry(m) for m in get_cached_models()
+        ]
+        self._json(200, {"models": models})
+
+    def _ollama_ps(self):
+        """GET /api/ps — list running models in Ollama format."""
+        loaded = manager.list_loaded()
+        models = []
+        for b in loaded:
+            if not b.get("ready"):
+                continue
+            alias = _generate_ollama_alias(b["model"]) or b["model"]
+            size_bytes = int(b.get("size_gb", 0) * 1024 ** 3)
+            models.append({
+                "name": alias,
+                "model": alias,
+                "size": size_bytes,
+                "digest": f"sha256:{b['model']}",
+                "details": {"format": "mlx"},
+                "expires_at": (
+                    datetime.now(timezone.utc).isoformat()
+                ),
+                "size_vram": size_bytes,
+            })
+        self._json(200, {"models": models})
+
+    def _ollama_chat(self):
+        """POST /api/chat — Ollama chat endpoint, proxied via OpenAI."""
+        raw = self._read_body()
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError:
+            self._json(400, self._error("Invalid JSON"))
+            return
+
+        ollama_model = body.get("model", "")
+        model_id = resolve_model(ollama_model)
+        is_stream = body.get("stream", True)  # Ollama defaults stream=true
+
+        # Convert Ollama request → OpenAI request
+        openai_body: dict = {
+            "model": model_id,
+            "messages": body.get("messages", []),
+            "stream": is_stream,
+        }
+        opts = body.get("options", {})
+        if "temperature" in opts:
+            openai_body["temperature"] = opts["temperature"]
+        if "top_p" in opts:
+            openai_body["top_p"] = opts["top_p"]
+        if "num_predict" in opts:
+            openai_body["max_tokens"] = opts["num_predict"]
+        if "stop" in opts:
+            openai_body["stop"] = opts["stop"]
+
+        # Get or start backend
+        backend, err = manager.get_or_start(model_id)
+        if not backend:
+            self._json(404, {"error": err or "model not found"})
+            return
+
+        openai_raw = json.dumps(openai_body).encode()
+
+        try:
+            conn = http.client.HTTPConnection(
+                "127.0.0.1", backend.port, timeout=300
+            )
+            conn.request(
+                "POST", "/v1/chat/completions", body=openai_raw,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(openai_raw)),
+                },
+            )
+            resp = conn.getresponse()
+
+            if resp.status != 200:
+                err_body = resp.read()
+                conn.close()
+                self.send_response(resp.status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(err_body)))
+                self.end_headers()
+                self.wfile.write(err_body)
+                return
+
+            if is_stream:
+                self._ollama_stream_chat(resp, ollama_model)
+            else:
+                self._ollama_nonstream_chat(resp, ollama_model)
+
+            conn.close()
+
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            log.exception("Ollama chat proxy error")
+            try:
+                self._json(502, {"error": str(exc)})
+            except Exception:
+                pass
+
+    def _ollama_stream_chat(self, resp, model_name: str):
+        """Convert OpenAI SSE stream to Ollama NDJSON stream."""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.end_headers()
+
+        buf = b""
+        t_start = time.monotonic()
+        eval_count = 0
+
+        try:
+            while True:
+                chunk = resp.read(4096)
+                if not chunk:
+                    break
+                buf += chunk
+
+                while b"\n" in buf:
+                    line_bytes, buf = buf.split(b"\n", 1)
+                    line = line_bytes.decode().strip()
+                    if not line:
+                        continue
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+
+                    if data_str == "[DONE]":
+                        duration_ns = int(
+                            (time.monotonic() - t_start) * 1e9
+                        )
+                        final = json.dumps({
+                            "model": model_name,
+                            "created_at": datetime.now(
+                                timezone.utc
+                            ).isoformat(),
+                            "message": {
+                                "role": "assistant", "content": ""
+                            },
+                            "done": True,
+                            "total_duration": duration_ns,
+                            "eval_count": eval_count,
+                        })
+                        self.wfile.write(final.encode() + b"\n")
+                        self.wfile.flush()
+                        return
+
+                    try:
+                        oai = json.loads(data_str)
+                        content = (
+                            oai.get("choices", [{}])[0]
+                            .get("delta", {})
+                            .get("content", "")
+                        )
+                        if content:
+                            eval_count += 1
+                            out = json.dumps({
+                                "model": model_name,
+                                "created_at": datetime.now(
+                                    timezone.utc
+                                ).isoformat(),
+                                "message": {
+                                    "role": "assistant",
+                                    "content": content,
+                                },
+                                "done": False,
+                            })
+                            self.wfile.write(out.encode() + b"\n")
+                            self.wfile.flush()
+                    except json.JSONDecodeError:
+                        pass
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _ollama_nonstream_chat(self, resp, model_name: str):
+        """Convert OpenAI non-streaming response to Ollama format."""
+        data = json.loads(resp.read())
+
+        content = ""
+        if data.get("choices"):
+            content = data["choices"][0].get("message", {}).get(
+                "content", ""
+            )
+
+        usage = data.get("usage", {})
+        ollama_resp = {
+            "model": model_name,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "message": {"role": "assistant", "content": content},
+            "done": True,
+            "total_duration": 0,
+            "prompt_eval_count": usage.get("prompt_tokens", 0),
+            "eval_count": usage.get("completion_tokens", 0),
+        }
+        self._json(200, ollama_resp)
+
+    def _ollama_generate(self):
+        """POST /api/generate — Ollama generate endpoint."""
+        raw = self._read_body()
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError:
+            self._json(400, self._error("Invalid JSON"))
+            return
+
+        ollama_model = body.get("model", "")
+        model_id = resolve_model(ollama_model)
+        prompt = body.get("prompt", "")
+        is_stream = body.get("stream", True)
+
+        # Convert to chat format
+        openai_body: dict = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": is_stream,
+        }
+        opts = body.get("options", {})
+        if "temperature" in opts:
+            openai_body["temperature"] = opts["temperature"]
+        if "num_predict" in opts:
+            openai_body["max_tokens"] = opts["num_predict"]
+
+        backend, err = manager.get_or_start(model_id)
+        if not backend:
+            self._json(404, {"error": err or "model not found"})
+            return
+
+        openai_raw = json.dumps(openai_body).encode()
+
+        try:
+            conn = http.client.HTTPConnection(
+                "127.0.0.1", backend.port, timeout=300
+            )
+            conn.request(
+                "POST", "/v1/chat/completions", body=openai_raw,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(openai_raw)),
+                },
+            )
+            resp = conn.getresponse()
+
+            if resp.status != 200:
+                err_body = resp.read()
+                conn.close()
+                self.send_response(resp.status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(err_body)))
+                self.end_headers()
+                self.wfile.write(err_body)
+                return
+
+            if is_stream:
+                self._ollama_stream_generate(resp, ollama_model)
+            else:
+                self._ollama_nonstream_generate(resp, ollama_model)
+
+            conn.close()
+
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            log.exception("Ollama generate proxy error")
+            try:
+                self._json(502, {"error": str(exc)})
+            except Exception:
+                pass
+
+    def _ollama_stream_generate(self, resp, model_name: str):
+        """Convert OpenAI SSE stream to Ollama generate NDJSON."""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.end_headers()
+
+        buf = b""
+        t_start = time.monotonic()
+
+        try:
+            while True:
+                chunk = resp.read(4096)
+                if not chunk:
+                    break
+                buf += chunk
+
+                while b"\n" in buf:
+                    line_bytes, buf = buf.split(b"\n", 1)
+                    line = line_bytes.decode().strip()
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+
+                    if data_str == "[DONE]":
+                        duration_ns = int(
+                            (time.monotonic() - t_start) * 1e9
+                        )
+                        final = json.dumps({
+                            "model": model_name,
+                            "created_at": datetime.now(
+                                timezone.utc
+                            ).isoformat(),
+                            "response": "",
+                            "done": True,
+                            "total_duration": duration_ns,
+                        })
+                        self.wfile.write(final.encode() + b"\n")
+                        self.wfile.flush()
+                        return
+
+                    try:
+                        oai = json.loads(data_str)
+                        content = (
+                            oai.get("choices", [{}])[0]
+                            .get("delta", {})
+                            .get("content", "")
+                        )
+                        if content:
+                            out = json.dumps({
+                                "model": model_name,
+                                "created_at": datetime.now(
+                                    timezone.utc
+                                ).isoformat(),
+                                "response": content,
+                                "done": False,
+                            })
+                            self.wfile.write(out.encode() + b"\n")
+                            self.wfile.flush()
+                    except json.JSONDecodeError:
+                        pass
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _ollama_nonstream_generate(self, resp, model_name: str):
+        """Convert OpenAI response to Ollama generate format."""
+        data = json.loads(resp.read())
+        content = ""
+        if data.get("choices"):
+            content = data["choices"][0].get("message", {}).get(
+                "content", ""
+            )
+        ollama_resp = {
+            "model": model_name,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "response": content,
+            "done": True,
+        }
+        self._json(200, ollama_resp)
+
+    def _ollama_show(self):
+        """POST /api/show — model info in Ollama format."""
+        raw = self._read_body()
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError:
+            self._json(400, self._error("Invalid JSON"))
+            return
+
+        model_name = body.get("model") or body.get("name", "")
+        model_id = resolve_model(model_name)
+
+        if not is_model_cached(model_id):
+            self._json(404, {"error": f"model '{model_name}' not found"})
+            return
+
+        cache_dir = HF_CACHE / f"models--{model_id.replace('/', '--')}"
+        details = {"format": "mlx", "family": "", "parameter_size": "",
+                    "quantization_level": ""}
+        model_info = {}
+
+        config_files = list(cache_dir.glob("snapshots/*/config.json"))
+        if config_files:
+            try:
+                cfg = json.loads(config_files[0].read_text())
+                details["family"] = cfg.get("model_type", "")
+                quant = cfg.get("quantization", {})
+                if isinstance(quant, dict):
+                    details["quantization_level"] = (
+                        f"Q{quant.get('bits', '?')}"
+                    )
+                model_info = {
+                    "hidden_size": cfg.get("hidden_size"),
+                    "num_hidden_layers": cfg.get("num_hidden_layers"),
+                    "num_attention_heads": cfg.get("num_attention_heads"),
+                    "vocab_size": cfg.get("vocab_size"),
+                    "context_length": cfg.get("max_position_embeddings"),
+                }
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        self._json(200, {
+            "model_info": model_info,
+            "details": details,
+            "modified_at": datetime.fromtimestamp(
+                cache_dir.stat().st_mtime, tz=timezone.utc
+            ).isoformat(),
+        })
 
 
 # ── Server ────────────────────────────────────────────────────────────────────
@@ -524,7 +1061,8 @@ def serve(port: int = DEFAULT_PORT):
         log.info("Received signal %d, shutting down...", signum)
         manager.stop_all()
         pid_file.unlink(missing_ok=True)
-        server.shutdown()
+        # Shutdown in a thread to avoid deadlock in signal handler
+        threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)

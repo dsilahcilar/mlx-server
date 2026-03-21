@@ -1,304 +1,352 @@
 #!/usr/bin/env bash
-# mlx-server — manage one or more local mlx_lm.server instances
-#
-# Usage:
-#   mlx-server start [model] [--port N] [--max-tokens N] [--thinking] [...]
-#   mlx-server stop  [model|--port N]   (omit to stop all)
-#   mlx-server status
-#   mlx-server list
-#   mlx-server logs  [model|--port N] [-f]
-#
-# Examples:
-#   mlx-server start
-#   mlx-server start mlx-community/Qwen3-8B-4bit --port 8089
-#   mlx-server start mlx-community/Qwen3-32B-4bit --port 8088
-#   mlx-server stop mlx-community/Qwen3-8B-4bit
-#   mlx-server stop --port 8089
-#   mlx-server stop                        # stops all
-#   mlx-server status
-#   mlx-server logs mlx-community/Qwen3-32B-4bit -f
-
+# mlx-server — Ollama-style CLI for managing local MLX inference on Apple Silicon
 set -eo pipefail
 
-# ── Defaults ────────────────────────────────────────────────────────────────
-DEFAULT_MODEL="mlx-community/Qwen3-32B-4bit"
-DEFAULT_PORT="8088"
-DEFAULT_MAX_TOKENS="4096"
-MLX_BIN="mlx_lm.server"
+# ── Resolve script directory (follows symlinks) ─────────────────────────────
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+    DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 
+# ── Configuration ────────────────────────────────────────────────────────────
+GATEWAY_SCRIPT="${SCRIPT_DIR}/mlx_gateway.py"
+GATEWAY_PORT="${MLX_PORT:-11070}"
+GATEWAY_URL="http://127.0.0.1:${GATEWAY_PORT}"
 MLX_HOME="${HOME}/.mlx"
+HF_CACHE="${HF_HOME:-${HOME}/.cache/huggingface}/hub"
 mkdir -p "${MLX_HOME}"
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
-_require_mlx() {
-  if ! command -v "${MLX_BIN}" &>/dev/null; then
-    echo "Error: mlx_lm.server not found. Install with: pipx install mlx-lm" >&2
-    exit 1
-  fi
-}
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
-# Returns the PID file path for a given port
-_pid_file()  { echo "${MLX_HOME}/server-${1}.pid"; }
-_log_file()  { echo "${MLX_HOME}/server-${1}.log"; }
-_meta_file() { echo "${MLX_HOME}/server-${1}.meta"; }  # stores model name
-
-# Returns the live PID for a port, or empty if not running
-_pid_for_port() {
-  local pf; pf=$(_pid_file "${1}")
+_gateway_pid() {
+  local pf="${MLX_HOME}/gateway.pid"
   [[ -f "${pf}" ]] || return 1
   local pid; pid=$(cat "${pf}")
   kill -0 "${pid}" 2>/dev/null && echo "${pid}" || { rm -f "${pf}"; return 1; }
 }
 
-# Finds the port for a given model name (first match)
-_port_for_model() {
-  local model="${1}"
-  for meta in "${MLX_HOME}"/server-*.meta; do
-    [[ -f "${meta}" ]] || continue
-    if grep -q "^model=${model}$" "${meta}" 2>/dev/null; then
-      local port; port=$(grep "^port=" "${meta}" | cut -d= -f2)
-      _pid_for_port "${port}" &>/dev/null && echo "${port}" && return 0
+_require_gateway() {
+  _gateway_pid &>/dev/null || {
+    echo "mlx-server is not running. Start it with: mlx-server serve"
+    exit 1
+  }
+}
+
+_ensure_gateway() {
+  # Auto-start gateway if not running
+  if ! _gateway_pid &>/dev/null; then
+    cmd_serve --quiet
+  fi
+}
+
+_api() {
+  local method="${1}" path="${2}" body="${3:-}"
+  if [[ -n "${body}" ]]; then
+    curl -sf --max-time 600 -X "${method}" "${GATEWAY_URL}${path}" \
+      -H "Content-Type: application/json" -d "${body}" 2>/dev/null
+  else
+    curl -sf --max-time 10 -X "${method}" "${GATEWAY_URL}${path}" 2>/dev/null
+  fi
+}
+
+_model_cache_dir() {
+  echo "${HF_CACHE}/models--$(echo "${1}" | sed 's|/|--|g')"
+}
+
+_find_mlx_python() {
+  # Get the Python interpreter from the mlx_lm.server shebang
+  local mlx_bin; mlx_bin=$(which mlx_lm.server 2>/dev/null || echo "")
+  if [[ -n "${mlx_bin}" ]]; then
+    local shebang; shebang=$(head -1 "${mlx_bin}" | sed 's/^#! *//')
+    if [[ -x "${shebang}" ]]; then
+      echo "${shebang}"
+      return 0
     fi
-  done
-  return 1
-}
-
-# List all running instances: "port model pid tracked"
-# Also detects orphan mlx_lm.server processes not started via this script
-_running_instances() {
-  local seen_pids=()
-
-  # Tracked instances (via PID files)
-  for meta in "${MLX_HOME}"/server-*.meta; do
-    [[ -f "${meta}" ]] || continue
-    local port; port=$(grep "^port=" "${meta}" | cut -d= -f2)
-    local model; model=$(grep "^model=" "${meta}" | cut -d= -f2)
-    local pid; pid=$(_pid_for_port "${port}" 2>/dev/null) || continue
-    echo "${port} ${model} ${pid} tracked"
-    seen_pids+=("${pid}")
-  done
-
-  # Orphan instances: mlx_lm.server processes not in our PID files
-  while IFS= read -r line; do
-    local pid; pid=$(echo "${line}" | awk '{print $2}')
-    # Skip if already tracked
-    local already=false
-    for sp in "${seen_pids[@]+"${seen_pids[@]}"}"; do
-      [[ "${sp}" == "${pid}" ]] && already=true && break
-    done
-    [[ "${already}" == true ]] && continue
-
-    local model; model=$(echo "${line}" | grep -o -- '--model [^ ]*' | awk '{print $2}')
-    local port; port=$(echo "${line}" | grep -o -- '--port [^ ]*' | awk '{print $2}')
-    [[ -z "${port}" ]] && port="unknown"
-    [[ -z "${model}" ]] && model="unknown"
-    echo "${port} ${model} ${pid} orphan"
-  done < <(ps aux | grep '[m]lx_lm.server')
-}
-
-_print_usage() {
-  cat <<EOF
-Usage: mlx-server <command> [options]
-
-Commands:
-  start [model] [options]         Start an MLX inference server instance
-  stop  [model | --port N]        Stop a specific instance (or all if omitted)
-  status                          Show all running instances
-  list                            Alias for status
-  models                          List locally downloaded MLX models
-  search [query]                  Search mlx-community models on HuggingFace
-  logs  [model | --port N] [-f]   View logs for an instance
-
-Start options:
-  model                     HuggingFace model ID  (default: ${DEFAULT_MODEL})
-  --port N                  Port to listen on      (default: ${DEFAULT_PORT})
-  --max-tokens N            Max tokens per response (default: ${DEFAULT_MAX_TOKENS})
-  --thinking                Enable chain-of-thought (disabled by default)
-  Any extra flags are passed directly to mlx_lm.server
-
-Examples:
-  mlx-server start
-  mlx-server start mlx-community/Qwen3-8B-4bit --port 8089
-  mlx-server start mlx-community/Qwen3-32B-4bit --port 8088 --max-tokens 8192
-  mlx-server stop mlx-community/Qwen3-8B-4bit
-  mlx-server stop --port 8089
-  mlx-server stop                               # stops all instances
-  mlx-server status
-  mlx-server models
-  mlx-server search Qwen3
-  mlx-server search llama 32b
-  mlx-server logs mlx-community/Qwen3-32B-4bit -f
-EOF
+  fi
+  echo "python3"
 }
 
 # ── Commands ─────────────────────────────────────────────────────────────────
-cmd_start() {
-  _require_mlx
 
-  local model="${DEFAULT_MODEL}"
-  local port="${DEFAULT_PORT}"
-  local max_tokens="${DEFAULT_MAX_TOKENS}"
-  local thinking=false
-  local extra_args=()
-
-  # First positional arg (if not a flag) is the model
-  if [[ $# -gt 0 && "${1}" != --* ]]; then
-    model="${1}"; shift
-  fi
+cmd_serve() {
+  local quiet=false
+  local port="${GATEWAY_PORT}"
 
   while [[ $# -gt 0 ]]; do
     case "${1}" in
-      --port)          port="${2}"; shift 2 ;;
-      --port=*)        port="${1#*=}"; shift ;;
-      --max-tokens)    max_tokens="${2}"; shift 2 ;;
-      --max-tokens=*)  max_tokens="${1#*=}"; shift ;;
-      --thinking)      thinking=true; shift ;;
-      *)               extra_args+=("${1}"); shift ;;
+      --port)    port="${2}"; shift 2 ;;
+      --port=*)  port="${1#*=}"; shift ;;
+      --quiet)   quiet=true; shift ;;
+      *)         shift ;;
     esac
   done
 
-  # Check if something is already on this port (tracked or not)
-  if pid=$(_pid_for_port "${port}" 2>/dev/null); then
-    local existing; existing=$(grep "^model=" "$(_meta_file "${port}")" 2>/dev/null | cut -d= -f2 || echo "unknown")
-    echo "Port ${port} is already tracked as '${existing}' (PID ${pid})."
-    echo "Stop it first: mlx-server stop --port ${port}"
-    exit 1
-  fi
-  if curl -s --max-time 2 "http://127.0.0.1:${port}/v1/models" &>/dev/null; then
-    echo "Port ${port} is already in use by an untracked process."
-    echo "Run 'mlx-server status' to see it, then stop it manually or choose a different --port."
-    exit 1
+  if _gateway_pid &>/dev/null; then
+    [[ "${quiet}" == false ]] && echo "mlx-server is already running (PID $(_gateway_pid)) on ${GATEWAY_URL}"
+    return 0
   fi
 
-  local thinking_arg=()
-  [[ "${thinking}" == false ]] && thinking_arg=(--chat-template-args '{"enable_thinking":false}')
+  [[ "${quiet}" == false ]] && echo "Starting mlx-server on port ${port}..."
 
-  echo "Starting mlx-server..."
-  echo "  Model:      ${model}"
-  echo "  Port:       ${port}"
-  echo "  Max tokens: ${max_tokens}"
-  echo "  Thinking:   ${thinking}"
-  [[ ${#extra_args[@]} -gt 0 ]] && echo "  Extra args: ${extra_args[*]}"
-  echo "  Logs:       $(_log_file "${port}")"
-  echo ""
-
-  nohup env HF_HUB_OFFLINE=1 "${MLX_BIN}" \
-    --model "${model}" \
-    --port "${port}" \
-    --max-tokens "${max_tokens}" \
-    "${thinking_arg[@]}" \
-    ${extra_args[@]+"${extra_args[@]}"} \
-    > "$(_log_file "${port}")" 2>&1 &
-
+  nohup python3 "${GATEWAY_SCRIPT}" --port "${port}" \
+    >> "${MLX_HOME}/gateway.log" 2>&1 &
   local pid=$!
   disown "${pid}"
-  echo "${pid}" > "$(_pid_file "${port}")"
-  printf "port=%s\nmodel=%s\n" "${port}" "${model}" > "$(_meta_file "${port}")"
 
-  echo -n "Waiting for server to load"
-  local waited=0
-  while ! curl -s "http://127.0.0.1:${port}/v1/models" &>/dev/null; do
-    sleep 3; waited=$((waited + 3)); echo -n "."
-    if [[ ${waited} -ge 300 ]]; then
-      echo ""; echo "Timeout. Check logs: mlx-server logs --port ${port}"; exit 1
+  # Wait for ready
+  [[ "${quiet}" == false ]] && echo -n "Waiting"
+  for _ in $(seq 1 30); do
+    if curl -sf --max-time 1 "http://127.0.0.1:${port}/_/health" &>/dev/null; then
+      [[ "${quiet}" == false ]] && echo ""
+      [[ "${quiet}" == false ]] && echo "✅ mlx-server running on http://127.0.0.1:${port}"
+      [[ "${quiet}" == false ]] && echo ""
+      [[ "${quiet}" == false ]] && echo "API:  http://127.0.0.1:${port}/v1/"
+      [[ "${quiet}" == false ]] && echo ""
+      [[ "${quiet}" == false ]] && echo "Next steps:"
+      [[ "${quiet}" == false ]] && echo "  mlx-server run <model>              Load a model and chat"
+      [[ "${quiet}" == false ]] && echo "  mlx-server ps                       Show loaded models"
+      [[ "${quiet}" == false ]] && echo "  mlx-server shutdown                 Stop everything"
+      return 0
     fi
+    sleep 1
+    [[ "${quiet}" == false ]] && echo -n "."
+  done
+
+  [[ "${quiet}" == false ]] && echo ""
+  echo "❌ Gateway failed to start. Check: mlx-server logs" >&2
+  exit 1
+}
+
+cmd_run() {
+  local model="${1:-}"
+  [[ -z "${model}" ]] && { echo "Usage: mlx-server run <model>"; exit 1; }
+
+  _ensure_gateway
+
+  # Auto-pull if not cached
+  local cache_dir; cache_dir=$(_model_cache_dir "${model}")
+  if [[ ! -d "${cache_dir}" ]]; then
+    echo "Model not found locally. Pulling first..."
+    cmd_pull "${model}" || exit 1
+  fi
+
+  # Load model via gateway
+  _api POST "/_/load" "{\"model\":\"${model}\"}" > /dev/null
+
+  # Wait for ready
+  echo -n "Loading ${model}"
+  for _ in $(seq 1 200); do
+    local ps_resp
+    ps_resp=$(_api GET "/_/ps") || { sleep 3; echo -n "."; continue; }
+    if python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+for m in data.get('models', []):
+    if m['model'] == sys.argv[1] and m.get('ready'):
+        sys.exit(0)
+sys.exit(1)
+" "${model}" <<< "${ps_resp}" 2>/dev/null; then
+      echo ""
+      echo "✅ ${model} ready"
+      echo ""
+      # Start interactive chat
+      python3 "${GATEWAY_SCRIPT}" chat "${GATEWAY_URL}" "${model}"
+      return 0
+    fi
+    sleep 3
+    echo -n "."
   done
 
   echo ""
-  echo "✅ mlx-server ready  →  http://127.0.0.1:${port}  (${model})"
+  echo "❌ Timed out loading model. Check: mlx-server logs" >&2
+  exit 1
 }
 
 cmd_stop() {
-  # Resolve target port
-  local port=""
+  _require_gateway
+  local model="${1:-}"
+  [[ -z "${model}" ]] && { echo "Usage: mlx-server stop <model>"; exit 1; }
 
-  if [[ $# -eq 0 ]]; then
-    # Stop all
-    local found=0
-    while IFS=" " read -r p m; do
-      local pid; pid=$(_pid_for_port "${p}")
-      echo "Stopping '${m}' on port ${p} (PID ${pid})..."
-      kill "${pid}"; rm -f "$(_pid_file "${p}")" "$(_meta_file "${p}")"
-      found=$((found + 1))
-    done < <(_running_instances)
-    [[ ${found} -eq 0 ]] && echo "No running mlx-server instances." || echo "✅ Stopped ${found} instance(s)."
-    return 0
+  local resp
+  resp=$(_api POST "/_/unload" "{\"model\":\"${model}\"}")
+  if [[ $? -eq 0 ]]; then
+    echo "✅ Stopped ${model}"
+  else
+    echo "Model '${model}' is not loaded."
   fi
-
-  case "${1}" in
-    --port)    port="${2}" ;;
-    --port=*)  port="${1#*=}" ;;
-    *)
-      # Treat arg as model name
-      port=$(_port_for_model "${1}") || { echo "No running instance found for model '${1}'."; exit 1; }
-      ;;
-  esac
-
-  local pid; pid=$(_pid_for_port "${port}" 2>/dev/null) || {
-    # Try to find orphan process on this port
-    local orphan_pid; orphan_pid=$(ps aux | grep '[m]lx_lm.server' | grep -- "--port ${port}" | awk '{print $2}' | head -1)
-    if [[ -n "${orphan_pid}" ]]; then
-      echo "Stopping untracked process on port ${port} (PID ${orphan_pid})..."
-      kill "${orphan_pid}" && echo "✅ Stopped."
-      return 0
-    fi
-    echo "No running instance on port ${port}."; exit 1
-  }
-  local model; model=$(grep "^model=" "$(_meta_file "${port}")" 2>/dev/null | cut -d= -f2 || echo "unknown")
-  echo "Stopping '${model}' on port ${port} (PID ${pid})..."
-  kill "${pid}"
-  rm -f "$(_pid_file "${port}")" "$(_meta_file "${port}")"
-  echo "✅ Stopped."
 }
 
-cmd_status() {
-  local instances; instances=$(_running_instances)
-  if [[ -z "${instances}" ]]; then
-    echo "⏹  No mlx-server instances running."
+cmd_pull() {
+  local model="${1:-}"
+  [[ -z "${model}" ]] && { echo "Usage: mlx-server pull <model>"; exit 1; }
+
+  local cache_dir; cache_dir=$(_model_cache_dir "${model}")
+  if [[ -d "${cache_dir}" ]]; then
+    echo "${model} is already downloaded."
     return 0
   fi
 
-  printf "%-8s  %-45s  %-10s  %s\n" "PORT" "MODEL" "PID" "STATUS"
-  printf "%-8s  %-45s  %-10s  %s\n" "--------" "---------------------------------------------" "----------" "------"
-  while IFS=" " read -r port model pid tracked; do
-    if [[ "${tracked}" == "orphan" ]]; then
-      printf "%-8s  %-45s  %-10s  ⚠️  running (untracked — started outside mlx-server)\n" "${port}" "${model}" "${pid}"
-    else
-      printf "%-8s  %-45s  %-10s  ✅ running\n" "${port}" "${model}" "${pid}"
-    fi
-  done <<< "${instances}"
+  echo "Pulling ${model}..."
+  local mlx_python; mlx_python=$(_find_mlx_python)
+
+  "${mlx_python}" -c "
+from huggingface_hub import snapshot_download
+import sys
+model = sys.argv[1]
+print(f'Downloading {model}...')
+snapshot_download(model)
+print(f'✅ {model} pulled successfully')
+" "${model}"
 }
 
-cmd_models() {
-  local hf_cache="${HF_HOME:-${HOME}/.cache/huggingface}/hub"
-  if [[ ! -d "${hf_cache}" ]]; then
-    echo "No HuggingFace cache found at ${hf_cache}"
+cmd_rm() {
+  local model="${1:-}"
+  [[ -z "${model}" ]] && { echo "Usage: mlx-server rm <model>"; exit 1; }
+
+  local cache_dir; cache_dir=$(_model_cache_dir "${model}")
+
+  if [[ ! -d "${cache_dir}" ]]; then
+    echo "Model '${model}' not found locally."
+    exit 1
+  fi
+
+  # Unload from gateway if running
+  if _gateway_pid &>/dev/null; then
+    _api POST "/_/unload" "{\"model\":\"${model}\"}" &>/dev/null || true
+  fi
+
+  local size; size=$(du -sh "${cache_dir}" 2>/dev/null | awk '{print $1}')
+  echo "Removing ${model} (${size})..."
+  rm -rf "${cache_dir}"
+  echo "✅ Removed."
+}
+
+cmd_show() {
+  local model="${1:-}"
+  [[ -z "${model}" ]] && { echo "Usage: mlx-server show <model>"; exit 1; }
+
+  local cache_dir; cache_dir=$(_model_cache_dir "${model}")
+
+  if [[ ! -d "${cache_dir}" ]]; then
+    echo "Model '${model}' not found locally."
+    echo "Pull it first: mlx-server pull ${model}"
+    exit 1
+  fi
+
+  local size; size=$(du -sh "${cache_dir}" 2>/dev/null | awk '{print $1}')
+
+  echo "  Model:     ${model}"
+  echo "  Size:      ${size}"
+  echo "  Location:  ${cache_dir}"
+  echo ""
+
+  # Parse config.json for model details
+  local config
+  config=$(find "${cache_dir}" -name "config.json" -path "*/snapshots/*" | head -1)
+
+  if [[ -n "${config}" && -f "${config}" ]]; then
+    echo "  Configuration:"
+    python3 -c "
+import json, sys
+
+with open(sys.argv[1]) as f:
+    c = json.load(f)
+
+arch = c.get('model_type', 'unknown')
+if arch == 'unknown' and 'architectures' in c:
+    arch = c['architectures'][0]
+
+hidden = c.get('hidden_size', '-')
+layers = c.get('num_hidden_layers', '-')
+heads = c.get('num_attention_heads', '-')
+ctx = c.get('max_position_embeddings', c.get('sliding_window', '-'))
+vocab = c.get('vocab_size', '-')
+
+quant = '-'
+if isinstance(c.get('quantization'), dict):
+    bits = c['quantization'].get('bits', '?')
+    group = c['quantization'].get('group_size', '?')
+    quant = f'{bits}-bit (group {group})'
+elif c.get('quantization'):
+    quant = str(c['quantization'])
+
+fields = [
+    ('Architecture', arch),
+    ('Hidden size', hidden),
+    ('Layers', layers),
+    ('Attention heads', heads),
+    ('Context length', ctx),
+    ('Vocab size', vocab),
+    ('Quantization', quant),
+]
+
+for label, val in fields:
+    print(f'    {label:<20} {val}')
+" "${config}"
+  fi
+}
+
+cmd_ps() {
+  if ! _gateway_pid &>/dev/null; then
+    echo "mlx-server is not running."
     return 0
   fi
 
-  # Collect running instances for status column
-  local running_info; running_info=$(_running_instances)
+  local resp
+  resp=$(_api GET "/_/ps") || { echo "Could not reach gateway."; exit 1; }
+
+  python3 -c "
+import json, sys
+
+data = json.loads(sys.stdin.read())
+models = data.get('models', [])
+
+if not models:
+    print('No models loaded.')
+    sys.exit(0)
+
+print(f\"{'NAME':<50}  {'SIZE':>6}  {'STATUS':<12}  IDLE\")
+print(f\"{'-'*50}  {'-'*6}  {'-'*12}  {'-'*6}\")
+
+for m in models:
+    name = m['model']
+    size = f\"{m.get('size_gb', 0):.0f}GB\" if m.get('size_gb') else '-'
+    if m.get('ready'):
+        status = '✅ running'
+    elif m.get('loading'):
+        status = '⏳ loading'
+    else:
+        status = '❌ error'
+    idle = m.get('idle', '-')
+    print(f'{name:<50}  {size:>6}  {status:<12}  {idle}')
+" <<< "${resp}"
+}
+
+cmd_list() {
+  if [[ ! -d "${HF_CACHE}" ]]; then
+    echo "No models downloaded."
+    return 0
+  fi
 
   local found=0
-  printf "%-50s  %-8s  %s\n" "MODEL" "SIZE" "STATUS"
-  printf "%-50s  %-8s  %s\n" "--------------------------------------------------" "--------" "------"
+  printf "%-50s  %8s  %s\n" "NAME" "SIZE" "MODIFIED"
+  printf "%-50s  %8s  %s\n" "$(printf '%.0s-' {1..50})" "--------" "----------"
 
-  for dir in "${hf_cache}"/models--*; do
+  for dir in "${HF_CACHE}"/models--*; do
     [[ -d "${dir}" ]] || continue
     local dir_name; dir_name=$(basename "${dir}")
     local model_id; model_id=$(echo "${dir_name}" | sed 's/^models--//' | sed 's/--/\//g')
-
     local size; size=$(du -sh "${dir}" 2>/dev/null | awk '{print $1}')
-    local status="⏹  not running"
-    local port; port=$(echo "${running_info}" | awk -v m="${model_id}" '$2==m {print $1}')
-    [[ -n "${port}" ]] && status="✅ running on :${port}"
-
-    printf "%-50s  %-8s  %s\n" "${model_id}" "${size}" "${status}"
+    local modified; modified=$(stat -f "%Sm" -t "%Y-%m-%d" "${dir}" 2>/dev/null || stat -c "%y" "${dir}" 2>/dev/null | cut -d' ' -f1)
+    printf "%-50s  %8s  %s\n" "${model_id}" "${size}" "${modified}"
     found=$((found + 1))
   done
 
   if [[ ${found} -eq 0 ]]; then
-    echo "No models found in ${hf_cache}"
+    echo "No models downloaded. Pull one with: mlx-server pull <model>"
   fi
 }
 
@@ -306,81 +354,128 @@ cmd_search() {
   local query="${*:-}"
   local limit=20
   local url="https://huggingface.co/api/models?author=mlx-community&sort=downloads&limit=${limit}"
-  [[ -n "${query}" ]] && url="${url}&search=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${query}")"
+  [[ -n "${query}" ]] && url="${url}&search=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(' '.join(sys.argv[1:])))" ${query})"
 
   echo "Searching mlx-community models${query:+ for \"${query}\"}..."
   echo ""
 
   local response
   if ! response=$(curl -sf --max-time 10 "${url}"); then
-    echo "Error: Could not reach HuggingFace API. Check your internet connection." >&2
+    echo "Error: Could not reach HuggingFace. Check your internet." >&2
     exit 1
   fi
 
-  # Get local cache list for downloaded indicator
-  local hf_cache="${HF_HOME:-${HOME}/.cache/huggingface}/hub"
-
-  python3 - <<PYEOF
+  python3 -c "
 import json, os, sys
 
-data = json.loads('''${response}''')
-hf_cache = "${hf_cache}"
+data = json.loads(sys.stdin.read())
+hf_cache = sys.argv[1]
 
-def cache_dir(model_id):
-    return os.path.join(hf_cache, "models--" + model_id.replace("/", "--"))
+def is_local(model_id):
+    return os.path.isdir(os.path.join(hf_cache, 'models--' + model_id.replace('/', '--')))
 
-def fmt_downloads(n):
-    if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
-    if n >= 1_000: return f"{n/1_000:.0f}k"
+def fmt(n):
+    if n >= 1_000_000: return f'{n/1_000_000:.1f}M'
+    if n >= 1_000: return f'{n/1_000:.0f}k'
     return str(n)
 
-print(f"{'MODEL':<52}  {'DOWNLOADS':>9}  {'LOCAL'}")
-print(f"{'-'*52}  {'-'*9}  {'-'*5}")
-for m in data:
-    mid = m["id"]
-    dl = fmt_downloads(m.get("downloads", 0))
-    local = "✅" if os.path.isdir(cache_dir(mid)) else ""
-    print(f"{mid:<52}  {dl:>9}  {local}")
+print(f\"{'NAME':<55}  {'DOWNLOADS':>9}  LOCAL\")
+print(f\"{'-'*55}  {'-'*9}  {'-'*5}\")
 
-print(f"\nShowing top {len(data)} results. Use 'mlx-server start <model>' to run one.")
-PYEOF
+for m in data:
+    mid = m['id']
+    dl = fmt(m.get('downloads', 0))
+    local = '✅' if is_local(mid) else ''
+    print(f'{mid:<55}  {dl:>9}  {local}')
+
+print(f'\nShowing top {len(data)} results.')
+print('Pull with: mlx-server pull <model>')
+" "${HF_CACHE}" <<< "${response}"
 }
 
 cmd_logs() {
-  local port=""
   local follow=false
-
   while [[ $# -gt 0 ]]; do
     case "${1}" in
-      --port)    port="${2}"; shift 2 ;;
-      --port=*)  port="${1#*=}"; shift ;;
-      -f)        follow=true; shift ;;
-      *)
-        # Treat as model name
-        port=$(_port_for_model "${1}") || { echo "No running instance for model '${1}'."; exit 1; }
-        shift ;;
+      -f) follow=true; shift ;;
+      *)  shift ;;
     esac
   done
 
-  # Default: first running instance
-  if [[ -z "${port}" ]]; then
-    port=$(_running_instances | awk '{print $1; exit}')
-    [[ -z "${port}" ]] && { echo "No running instances. Specify --port N."; exit 1; }
-  fi
-
-  local log; log=$(_log_file "${port}")
-  [[ -f "${log}" ]] || { echo "No log file found for port ${port}."; exit 1; }
+  local log="${MLX_HOME}/gateway.log"
+  [[ -f "${log}" ]] || { echo "No log file found."; exit 1; }
   [[ "${follow}" == true ]] && tail -f "${log}" || tail -50 "${log}"
+}
+
+cmd_shutdown() {
+  local pid
+  pid=$(_gateway_pid) || { echo "mlx-server is not running."; return 0; }
+
+  echo "Shutting down mlx-server (PID ${pid})..."
+  kill "${pid}"
+
+  # Wait for clean exit
+  for _ in $(seq 1 10); do
+    kill -0 "${pid}" 2>/dev/null || { echo "✅ Stopped."; return 0; }
+    sleep 1
+  done
+  echo "✅ Stopped."
+}
+
+print_usage() {
+  cat <<EOF
+Usage: mlx-server <command> [options]
+
+Server:
+  serve [--port N]              Start the mlx-server gateway  (default: ${GATEWAY_PORT})
+  shutdown                      Stop the gateway and all loaded models
+
+Models:
+  run <model>                   Load a model and start interactive chat
+  stop <model>                  Unload a model from memory
+  pull <model>                  Download a model from HuggingFace
+  rm <model>                    Delete a downloaded model
+  show <model>                  Show model details
+
+Info:
+  ps                            List currently loaded models
+  list                          List locally downloaded models
+  search [query]                Search mlx-community models on HuggingFace
+  logs [-f]                     View gateway logs
+
+Environment:
+  MLX_PORT                      Gateway port (default: 11070)
+
+Examples:
+  mlx-server serve
+  mlx-server pull mlx-community/Qwen3-32B-4bit
+  mlx-server run mlx-community/Qwen3-32B-4bit
+  mlx-server run mlx-community/Qwen3-8B-4bit
+  mlx-server ps
+  mlx-server stop mlx-community/Qwen3-8B-4bit
+  mlx-server search llama
+  mlx-server shutdown
+
+API (single endpoint, multiple models):
+  curl http://127.0.0.1:${GATEWAY_PORT}/v1/chat/completions \\
+    -H "Content-Type: application/json" \\
+    -d '{"model":"mlx-community/Qwen3-32B-4bit","messages":[{"role":"user","content":"Hello"}]}'
+EOF
 }
 
 # ── Entry point ──────────────────────────────────────────────────────────────
 case "${1:-}" in
-  start)        shift; cmd_start "$@" ;;
-  stop)         shift; cmd_stop "$@" ;;
-  status|list)  shift; cmd_status ;;
-  models)       shift; cmd_models ;;
-  search)       shift; cmd_search "$@" ;;
-  logs)         shift; cmd_logs "$@" ;;
-  -h|--help|help|"") _print_usage ;;
-  *) echo "Unknown command: ${1}"; echo ""; _print_usage; exit 1 ;;
+  serve)      shift; cmd_serve "$@" ;;
+  run)        shift; cmd_run "$@" ;;
+  stop)       shift; cmd_stop "$@" ;;
+  pull)       shift; cmd_pull "$@" ;;
+  rm|remove)  shift; cmd_rm "$@" ;;
+  show)       shift; cmd_show "$@" ;;
+  ps)         shift; cmd_ps ;;
+  list|ls)    shift; cmd_list ;;
+  search)     shift; cmd_search "$@" ;;
+  logs)       shift; cmd_logs "$@" ;;
+  shutdown)   shift; cmd_shutdown ;;
+  -h|--help|help|"") print_usage ;;
+  *)          echo "Unknown command: ${1}"; echo ""; print_usage; exit 1 ;;
 esac

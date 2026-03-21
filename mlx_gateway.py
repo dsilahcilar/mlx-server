@@ -521,17 +521,20 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             if is_stream:
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "keep-alive")
+                self.send_header("Connection", "close")
                 self.end_headers()
                 try:
                     while True:
-                        chunk = resp.read(4096)
-                        if not chunk:
+                        line = resp.readline()
+                        if not line:
                             break
-                        self.wfile.write(chunk)
+                        self.wfile.write(line)
                         self.wfile.flush()
+                        if line.strip() == b"data: [DONE]":
+                            break
                 except (BrokenPipeError, ConnectionResetError):
                     pass
+                self.close_connection = True
             else:
                 data = resp.read()
                 for key, val in resp.getheaders():
@@ -1142,6 +1145,10 @@ def chat_repl(base_url: str, model: str):
                     except json.JSONDecodeError:
                         pass
             print("\n")
+        except KeyboardInterrupt:
+            print("\n")
+            messages.pop()  # Remove interrupted user message
+            continue
         except urllib.error.HTTPError as e:
             body = e.read().decode()
             print(f"\nError ({e.code}): {body}\n")

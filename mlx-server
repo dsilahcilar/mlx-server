@@ -448,6 +448,96 @@ cmd_logs() {
   [[ "${follow}" == true ]] && tail -f "${log}" || tail -50 "${log}"
 }
 
+cmd_stats() {
+  if ! _gateway_pid &>/dev/null; then
+    echo "mlx-server is not running."
+    return 0
+  fi
+
+  local resp
+  resp=$(_api GET "/_/metrics") || { echo "Could not reach gateway."; exit 1; }
+
+  python3 -c "
+import json, sys
+
+data = json.loads(sys.stdin.read())
+uptime = data.get('uptime_seconds', 0)
+hours, rem = divmod(uptime, 3600)
+mins, secs = divmod(rem, 60)
+uptime_str = f'{hours}h {mins}m {secs}s' if hours else f'{mins}m {secs}s'
+
+print(f'Uptime:          {uptime_str}')
+print(f'Total requests:  {data[\"total_requests\"]}')
+print(f'Total errors:    {data[\"total_errors\"]}')
+print()
+
+models = data.get('models', {})
+if not models:
+    print('No requests recorded yet.')
+    sys.exit(0)
+
+print(f\"{'MODEL':<45}  {'REQS':>6}  {'ERRORS':>6}  {'PROMPT':>8}  {'COMPLT':>8}  {'CACHED':>8}  {'AVG MS':>8}  {'MAX MS':>8}\")
+print(f\"{'-'*45}  {'-'*6}  {'-'*6}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}\")
+
+for model, s in sorted(models.items()):
+    name = model[-45:] if len(model) > 45 else model
+    cache_pct = f\"{100*s['cached_tokens']//s['prompt_tokens']}%\" if s['prompt_tokens'] > 0 else '-'
+    print(f'{name:<45}  {s[\"requests\"]:>6}  {s[\"errors\"]:>6}  {s[\"prompt_tokens\"]:>8}  {s[\"completion_tokens\"]:>8}  {cache_pct:>8}  {s[\"latency_avg_ms\"]:>8.0f}  {s[\"latency_max_ms\"]:>8.0f}')
+" <<< "${resp}"
+}
+
+cmd_requests() {
+  if ! _gateway_pid &>/dev/null; then
+    # Fall back to reading log file
+    local req_log="${MLX_HOME}/requests.jsonl"
+    [[ -f "${req_log}" ]] || { echo "No request log found."; exit 1; }
+    echo "Recent requests (from log file):"
+    tail -20 "${req_log}" | python3 -c "
+import json, sys
+for line in sys.stdin:
+    try:
+        r = json.loads(line)
+        ts = r['ts'][11:19]
+        print(f\"{ts}  {r['model']:<45}  {r.get('prompt_tokens',0):>6}pt  {r.get('completion_tokens',0):>6}ct  {r.get('latency_ms',0):>7.0f}ms  {'ERR' if r.get('error') else 'OK'}\")
+    except Exception:
+        pass
+"
+    return 0
+  fi
+
+  local n="${1:-20}"
+  local resp
+  resp=$(_api GET "/_/requests?n=${n}") || { echo "Could not reach gateway."; exit 1; }
+
+  python3 -c "
+import json, sys
+
+data = json.loads(sys.stdin.read())
+requests = data.get('requests', [])
+
+if not requests:
+    print('No requests recorded yet.')
+    sys.exit(0)
+
+print(f\"{'TIME':>8}  {'MODEL':<40}  {'PT':>6}  {'CT':>6}  {'CACHED':>6}  {'MS':>7}  STATUS\")
+print(f\"{'-'*8}  {'-'*40}  {'-'*6}  {'-'*6}  {'-'*6}  {'-'*7}  {'-'*6}\")
+
+for r in requests:
+    ts = r['ts'][11:19]
+    model = r['model'][-40:]
+    pt = r.get('prompt_tokens', 0)
+    ct = r.get('completion_tokens', 0)
+    cached = r.get('cached_tokens', 0)
+    ms = r.get('latency_ms', 0)
+    status = '❌' if r.get('error') else '✅'
+    stream = '~' if r.get('stream') else ' '
+    print(f'{ts}  {model:<40}  {pt:>6}  {ct:>6}  {cached:>6}  {ms:>7.0f}  {status}{stream}')
+
+print()
+print(f'Showing {len(requests)} most recent. ~ = streaming request')
+" <<< "${resp}"
+}
+
 cmd_shutdown() {
   local pid
   pid=$(_gateway_pid) || { echo "mlx-server is not running."; return 0; }
@@ -483,6 +573,8 @@ Info:
   list                          List locally downloaded models
   search [query]                Search mlx-community models on HuggingFace
   logs [-f]                     View gateway logs
+  stats                         Show request metrics (tokens, latency, cache hits)
+  requests [n]                  Show recent requests (default: last 20)
 
 Environment:
   MLX_PORT                      Gateway port (default: 11070)
@@ -516,6 +608,8 @@ case "${1:-}" in
   list|ls)    shift; cmd_list ;;
   search)     shift; cmd_search "$@" ;;
   logs)       shift; cmd_logs "$@" ;;
+  stats)      shift; cmd_stats ;;
+  requests)   shift; cmd_requests "$@" ;;
   shutdown)   shift; cmd_shutdown ;;
   -h|--help|help|"") print_usage ;;
   *)          echo "Unknown command: ${1}"; echo ""; print_usage; exit 1 ;;

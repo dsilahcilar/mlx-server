@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,16 +28,130 @@ from pathlib import Path
 DEFAULT_PORT = 11070
 BACKEND_BASE_PORT = 18100
 MAX_TOKENS_DEFAULT = 4096
+REQUEST_LOG_MAX = 1000  # keep last N requests in memory
 
 MLX_HOME = Path.home() / ".mlx"
 HF_CACHE = Path(os.environ.get(
     "HF_HOME", str(Path.home() / ".cache" / "huggingface")
 )) / "hub"
+REQUEST_LOG_FILE = MLX_HOME / "requests.jsonl"
 
 log = logging.getLogger("mlx-gateway")
 
 
-# ── Utilities ─────────────────────────────────────────────────────────────────
+# ── Metrics ───────────────────────────────────────────────────────────────────
+
+class ModelMetrics:
+    """Per-model request counters and token stats."""
+    __slots__ = (
+        "requests", "errors", "prompt_tokens", "completion_tokens",
+        "cached_tokens", "latency_total_ms", "latency_min_ms", "latency_max_ms",
+    )
+
+    def __init__(self):
+        self.requests = 0
+        self.errors = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.cached_tokens = 0
+        self.latency_total_ms = 0.0
+        self.latency_min_ms = float("inf")
+        self.latency_max_ms = 0.0
+
+    def record(self, latency_ms: float, prompt: int, completion: int, cached: int, error: bool):
+        self.requests += 1
+        if error:
+            self.errors += 1
+        self.prompt_tokens += prompt
+        self.completion_tokens += completion
+        self.cached_tokens += cached
+        self.latency_total_ms += latency_ms
+        self.latency_min_ms = min(self.latency_min_ms, latency_ms)
+        self.latency_max_ms = max(self.latency_max_ms, latency_ms)
+
+    @property
+    def avg_latency_ms(self) -> float:
+        return self.latency_total_ms / self.requests if self.requests else 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "requests": self.requests,
+            "errors": self.errors,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "cached_tokens": self.cached_tokens,
+            "latency_avg_ms": round(self.avg_latency_ms, 1),
+            "latency_min_ms": round(self.latency_min_ms, 1) if self.requests else 0,
+            "latency_max_ms": round(self.latency_max_ms, 1),
+        }
+
+
+class MetricsCollector:
+    """Thread-safe metrics store + request log."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._models: dict[str, ModelMetrics] = {}
+        self._recent: deque[dict] = deque(maxlen=REQUEST_LOG_MAX)
+        self._start_time = time.time()
+        MLX_HOME.mkdir(parents=True, exist_ok=True)
+
+    def record(
+        self,
+        model_id: str,
+        latency_ms: float,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        cached_tokens: int = 0,
+        error: bool = False,
+        endpoint: str = "",
+        stream: bool = False,
+    ):
+        with self._lock:
+            if model_id not in self._models:
+                self._models[model_id] = ModelMetrics()
+            self._models[model_id].record(
+                latency_ms, prompt_tokens, completion_tokens, cached_tokens, error
+            )
+            entry = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "model": model_id,
+                "endpoint": endpoint,
+                "stream": stream,
+                "latency_ms": round(latency_ms, 1),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "cached_tokens": cached_tokens,
+                "error": error,
+            }
+            self._recent.append(entry)
+        # Write to log file (outside lock for performance)
+        try:
+            with open(REQUEST_LOG_FILE, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError:
+            pass
+
+    def get_summary(self) -> dict:
+        with self._lock:
+            uptime = time.time() - self._start_time
+            total = sum(m.requests for m in self._models.values())
+            errors = sum(m.errors for m in self._models.values())
+            return {
+                "uptime_seconds": int(uptime),
+                "total_requests": total,
+                "total_errors": errors,
+                "models": {k: v.to_dict() for k, v in self._models.items()},
+            }
+
+    def get_recent(self, n: int = 50) -> list[dict]:
+        with self._lock:
+            entries = list(self._recent)
+        return entries[-n:]
+
+
+metrics = MetricsCollector()
+
 
 def find_mlx_server_bin() -> str | None:
     """Find the mlx_lm.server executable on PATH."""
@@ -485,6 +600,14 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             self._json(200, {"models": manager.list_loaded()})
         elif self.path == "/_/health":
             self._json(200, {"status": "ok"})
+        elif self.path == "/_/metrics":
+            self._json(200, metrics.get_summary())
+        elif self.path.startswith("/_/requests"):
+            # /_/requests?n=50
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            n = int(qs.get("n", ["50"])[0])
+            self._json(200, {"requests": metrics.get_recent(n)})
         # ── Ollama API ────────────────────────────────────────────────────
         elif self.path == "/":
             self._json(200, {"status": "mlx-server is running"})
@@ -593,6 +716,14 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
         is_stream = body.get("stream", False)
 
+        # Inject stream_options to get token usage in the final streaming chunk
+        if is_stream and self.path in ("/v1/chat/completions", "/v1/completions"):
+            body.setdefault("stream_options", {})
+            body["stream_options"]["include_usage"] = True
+
+        t_start = time.monotonic()
+        error_occurred = False
+
         try:
             forwarded = json.dumps(body).encode()
             conn = http.client.HTTPConnection(
@@ -608,6 +739,10 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             resp = conn.getresponse()
 
             self.send_response(resp.status)
+            if resp.status >= 400:
+                error_occurred = True
+
+            prompt_tokens = completion_tokens = cached_tokens = 0
 
             if is_stream:
                 self.send_header("Content-Type", "text/event-stream")
@@ -621,7 +756,22 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                             break
                         self.wfile.write(line)
                         self.wfile.flush()
-                        if line.strip() == b"data: [DONE]":
+                        # Parse usage from the special trailing usage chunk
+                        stripped = line.strip()
+                        if stripped.startswith(b"data: ") and stripped != b"data: [DONE]":
+                            try:
+                                chunk = json.loads(stripped[6:])
+                                usage = chunk.get("usage") or {}
+                                if usage:
+                                    prompt_tokens = usage.get("prompt_tokens", 0)
+                                    completion_tokens = usage.get("completion_tokens", 0)
+                                    cached_tokens = (
+                                        (usage.get("prompt_tokens_details") or {})
+                                        .get("cached_tokens", 0)
+                                    )
+                            except (json.JSONDecodeError, KeyError):
+                                pass
+                        if stripped == b"data: [DONE]":
                             break
                 except (BrokenPipeError, ConnectionResetError):
                     pass
@@ -634,12 +784,25 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+                # Parse usage from non-streaming response
+                try:
+                    resp_body = json.loads(data)
+                    usage = resp_body.get("usage") or {}
+                    prompt_tokens = usage.get("prompt_tokens", 0)
+                    completion_tokens = usage.get("completion_tokens", 0)
+                    cached_tokens = (
+                        (usage.get("prompt_tokens_details") or {})
+                        .get("cached_tokens", 0)
+                    )
+                except (json.JSONDecodeError, KeyError):
+                    pass
 
             conn.close()
 
         except (BrokenPipeError, ConnectionResetError):
-            pass
+            error_occurred = True
         except Exception as exc:
+            error_occurred = True
             log.exception("Proxy error for %s", model_id)
             try:
                 self._json(
@@ -648,6 +811,18 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 )
             except Exception:
                 pass
+        finally:
+            latency_ms = (time.monotonic() - t_start) * 1000
+            metrics.record(
+                model_id=model_id,
+                latency_ms=latency_ms,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cached_tokens=cached_tokens,
+                error=error_occurred,
+                endpoint=self.path,
+                stream=is_stream,
+            )
 
     # ── Management API ────────────────────────────────────────────────────
 

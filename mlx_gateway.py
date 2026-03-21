@@ -95,6 +95,35 @@ class MetricsCollector:
         self._recent: deque[dict] = deque(maxlen=REQUEST_LOG_MAX)
         self._start_time = time.time()
         MLX_HOME.mkdir(parents=True, exist_ok=True)
+        self._preload()
+
+    def _preload(self):
+        """Load recent entries from requests.jsonl into memory on startup."""
+        if not REQUEST_LOG_FILE.exists():
+            return
+        try:
+            lines = REQUEST_LOG_FILE.read_text().splitlines()
+            # Load the last REQUEST_LOG_MAX entries
+            for line in lines[-REQUEST_LOG_MAX:]:
+                try:
+                    entry = json.loads(line)
+                    self._recent.append(entry)
+                    # Replay into per-model stats
+                    model_id = entry.get("model", "")
+                    if model_id:
+                        if model_id not in self._models:
+                            self._models[model_id] = ModelMetrics()
+                        self._models[model_id].record(
+                            latency_ms=entry.get("latency_ms", 0),
+                            prompt=entry.get("prompt_tokens", 0),
+                            completion=entry.get("completion_tokens", 0),
+                            cached=entry.get("cached_tokens", 0),
+                            error=entry.get("error", False),
+                        )
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        except OSError:
+            pass
 
     def record(
         self,
@@ -957,7 +986,11 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             "model": model_id,
             "messages": body.get("messages", []),
             "stream": is_stream,
+            # Always request usage so we can record metrics
+            "stream_options": {"include_usage": True} if is_stream else None,
         }
+        if not is_stream:
+            del openai_body["stream_options"]
         opts = body.get("options", {})
         if "temperature" in opts:
             openai_body["temperature"] = opts["temperature"]
@@ -975,6 +1008,8 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             return
 
         openai_raw = json.dumps(openai_body).encode()
+        t_start = time.monotonic()
+        error_occurred = False
 
         try:
             conn = http.client.HTTPConnection(
@@ -990,6 +1025,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             resp = conn.getresponse()
 
             if resp.status != 200:
+                error_occurred = True
                 err_body = resp.read()
                 conn.close()
                 self.send_response(resp.status)
@@ -999,116 +1035,133 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(err_body)
                 return
 
+            prompt_tokens = completion_tokens = cached_tokens = 0
+
             if is_stream:
-                self._ollama_stream_chat(resp, ollama_model)
+                prompt_tokens, completion_tokens, cached_tokens = \
+                    self._ollama_stream_chat(resp, ollama_model)
             else:
-                self._ollama_nonstream_chat(resp, ollama_model)
+                prompt_tokens, completion_tokens, cached_tokens = \
+                    self._ollama_nonstream_chat(resp, ollama_model)
 
             conn.close()
 
         except (BrokenPipeError, ConnectionResetError):
-            pass
+            error_occurred = True
         except Exception as exc:
+            error_occurred = True
             log.exception("Ollama chat proxy error")
             try:
                 self._json(502, {"error": str(exc)})
             except Exception:
                 pass
+        finally:
+            latency_ms = (time.monotonic() - t_start) * 1000
+            metrics.record(
+                model_id=model_id,
+                latency_ms=latency_ms,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cached_tokens=cached_tokens,
+                error=error_occurred,
+                endpoint="/api/chat",
+                stream=is_stream,
+            )
 
-    def _ollama_stream_chat(self, resp, model_name: str):
-        """Convert OpenAI SSE stream to Ollama NDJSON stream."""
+    def _ollama_stream_chat(self, resp, model_name: str) -> tuple[int, int, int]:
+        """Convert OpenAI SSE stream to Ollama NDJSON stream. Returns (prompt, completion, cached) tokens."""
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.end_headers()
 
-        buf = b""
         t_start = time.monotonic()
         eval_count = 0
+        prompt_tokens = completion_tokens = cached_tokens = 0
 
         try:
             while True:
-                chunk = resp.read(4096)
-                if not chunk:
+                line = resp.readline()
+                if not line:
                     break
-                buf += chunk
+                line_str = line.decode().strip()
+                if not line_str or not line_str.startswith("data: "):
+                    continue
+                data_str = line_str[6:]
 
-                while b"\n" in buf:
-                    line_bytes, buf = buf.split(b"\n", 1)
-                    line = line_bytes.decode().strip()
-                    if not line:
-                        continue
-                    if not line.startswith("data: "):
-                        continue
-                    data_str = line[6:]
+                if data_str == "[DONE]":
+                    break
 
-                    if data_str == "[DONE]":
-                        duration_ns = int(
-                            (time.monotonic() - t_start) * 1e9
+                try:
+                    oai = json.loads(data_str)
+                    # Capture usage from the trailing usage chunk
+                    usage = oai.get("usage") or {}
+                    if usage:
+                        prompt_tokens = usage.get("prompt_tokens", 0)
+                        completion_tokens = usage.get("completion_tokens", 0)
+                        cached_tokens = (
+                            (usage.get("prompt_tokens_details") or {})
+                            .get("cached_tokens", 0)
                         )
+                    choices = oai.get("choices", [])
+                    if not choices:
+                        continue
+                    content = choices[0].get("delta", {}).get("content", "")
+                    finish = choices[0].get("finish_reason")
+                    if content:
+                        eval_count += 1
+                        out = json.dumps({
+                            "model": model_name,
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                            "message": {"role": "assistant", "content": content},
+                            "done": False,
+                        })
+                        self.wfile.write(out.encode() + b"\n")
+                        self.wfile.flush()
+                    if finish == "stop":
+                        duration_ns = int((time.monotonic() - t_start) * 1e9)
                         final = json.dumps({
                             "model": model_name,
-                            "created_at": datetime.now(
-                                timezone.utc
-                            ).isoformat(),
-                            "message": {
-                                "role": "assistant", "content": ""
-                            },
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                            "message": {"role": "assistant", "content": ""},
                             "done": True,
                             "total_duration": duration_ns,
                             "eval_count": eval_count,
                         })
                         self.wfile.write(final.encode() + b"\n")
                         self.wfile.flush()
-                        return
-
-                    try:
-                        oai = json.loads(data_str)
-                        content = (
-                            oai.get("choices", [{}])[0]
-                            .get("delta", {})
-                            .get("content", "")
-                        )
-                        if content:
-                            eval_count += 1
-                            out = json.dumps({
-                                "model": model_name,
-                                "created_at": datetime.now(
-                                    timezone.utc
-                                ).isoformat(),
-                                "message": {
-                                    "role": "assistant",
-                                    "content": content,
-                                },
-                                "done": False,
-                            })
-                            self.wfile.write(out.encode() + b"\n")
-                            self.wfile.flush()
-                    except json.JSONDecodeError:
-                        pass
+                except json.JSONDecodeError:
+                    pass
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def _ollama_nonstream_chat(self, resp, model_name: str):
-        """Convert OpenAI non-streaming response to Ollama format."""
+        return prompt_tokens, completion_tokens, cached_tokens
+
+    def _ollama_nonstream_chat(self, resp, model_name: str) -> tuple[int, int, int]:
+        """Convert OpenAI non-streaming response to Ollama format. Returns (prompt, completion, cached) tokens."""
         data = json.loads(resp.read())
 
         content = ""
         if data.get("choices"):
-            content = data["choices"][0].get("message", {}).get(
-                "content", ""
-            )
+            content = data["choices"][0].get("message", {}).get("content", "")
 
         usage = data.get("usage", {})
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        cached_tokens = (
+            (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+        )
+
         ollama_resp = {
             "model": model_name,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "message": {"role": "assistant", "content": content},
             "done": True,
             "total_duration": 0,
-            "prompt_eval_count": usage.get("prompt_tokens", 0),
-            "eval_count": usage.get("completion_tokens", 0),
+            "prompt_eval_count": prompt_tokens,
+            "eval_count": completion_tokens,
         }
         self._json(200, ollama_resp)
+        return prompt_tokens, completion_tokens, cached_tokens
 
     def _ollama_generate(self):
         """POST /api/generate — Ollama generate endpoint."""
@@ -1129,7 +1182,10 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             "model": model_id,
             "messages": [{"role": "user", "content": prompt}],
             "stream": is_stream,
+            "stream_options": {"include_usage": True} if is_stream else None,
         }
+        if not is_stream:
+            del openai_body["stream_options"]
         opts = body.get("options", {})
         if "temperature" in opts:
             openai_body["temperature"] = opts["temperature"]
@@ -1142,6 +1198,9 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             return
 
         openai_raw = json.dumps(openai_body).encode()
+        t_start = time.monotonic()
+        error_occurred = False
+        prompt_tokens = completion_tokens = cached_tokens = 0
 
         try:
             conn = http.client.HTTPConnection(
@@ -1157,6 +1216,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             resp = conn.getresponse()
 
             if resp.status != 200:
+                error_occurred = True
                 err_body = resp.read()
                 conn.close()
                 self.send_response(resp.status)
@@ -1167,99 +1227,122 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             if is_stream:
-                self._ollama_stream_generate(resp, ollama_model)
+                prompt_tokens, completion_tokens, cached_tokens = \
+                    self._ollama_stream_generate(resp, ollama_model)
             else:
-                self._ollama_nonstream_generate(resp, ollama_model)
+                prompt_tokens, completion_tokens, cached_tokens = \
+                    self._ollama_nonstream_generate(resp, ollama_model)
 
             conn.close()
 
         except (BrokenPipeError, ConnectionResetError):
-            pass
+            error_occurred = True
         except Exception as exc:
+            error_occurred = True
             log.exception("Ollama generate proxy error")
             try:
                 self._json(502, {"error": str(exc)})
             except Exception:
                 pass
+        finally:
+            latency_ms = (time.monotonic() - t_start) * 1000
+            metrics.record(
+                model_id=model_id,
+                latency_ms=latency_ms,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cached_tokens=cached_tokens,
+                error=error_occurred,
+                endpoint="/api/generate",
+                stream=is_stream,
+            )
 
-    def _ollama_stream_generate(self, resp, model_name: str):
-        """Convert OpenAI SSE stream to Ollama generate NDJSON."""
+    def _ollama_stream_generate(self, resp, model_name: str) -> tuple[int, int, int]:
+        """Convert OpenAI SSE stream to Ollama generate NDJSON. Returns (prompt, completion, cached) tokens."""
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.end_headers()
 
-        buf = b""
         t_start = time.monotonic()
+        prompt_tokens = completion_tokens = cached_tokens = 0
 
         try:
             while True:
-                chunk = resp.read(4096)
-                if not chunk:
+                line = resp.readline()
+                if not line:
                     break
-                buf += chunk
+                line_str = line.decode().strip()
+                if not line_str or not line_str.startswith("data: "):
+                    continue
+                data_str = line_str[6:]
 
-                while b"\n" in buf:
-                    line_bytes, buf = buf.split(b"\n", 1)
-                    line = line_bytes.decode().strip()
-                    if not line or not line.startswith("data: "):
-                        continue
-                    data_str = line[6:]
+                if data_str == "[DONE]":
+                    break
 
-                    if data_str == "[DONE]":
-                        duration_ns = int(
-                            (time.monotonic() - t_start) * 1e9
+                try:
+                    oai = json.loads(data_str)
+                    usage = oai.get("usage") or {}
+                    if usage:
+                        prompt_tokens = usage.get("prompt_tokens", 0)
+                        completion_tokens = usage.get("completion_tokens", 0)
+                        cached_tokens = (
+                            (usage.get("prompt_tokens_details") or {})
+                            .get("cached_tokens", 0)
                         )
+                    choices = oai.get("choices", [])
+                    if not choices:
+                        continue
+                    content = choices[0].get("delta", {}).get("content", "")
+                    finish = choices[0].get("finish_reason")
+                    if content:
+                        out = json.dumps({
+                            "model": model_name,
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                            "response": content,
+                            "done": False,
+                        })
+                        self.wfile.write(out.encode() + b"\n")
+                        self.wfile.flush()
+                    if finish == "stop":
+                        duration_ns = int((time.monotonic() - t_start) * 1e9)
                         final = json.dumps({
                             "model": model_name,
-                            "created_at": datetime.now(
-                                timezone.utc
-                            ).isoformat(),
+                            "created_at": datetime.now(timezone.utc).isoformat(),
                             "response": "",
                             "done": True,
                             "total_duration": duration_ns,
                         })
                         self.wfile.write(final.encode() + b"\n")
                         self.wfile.flush()
-                        return
-
-                    try:
-                        oai = json.loads(data_str)
-                        content = (
-                            oai.get("choices", [{}])[0]
-                            .get("delta", {})
-                            .get("content", "")
-                        )
-                        if content:
-                            out = json.dumps({
-                                "model": model_name,
-                                "created_at": datetime.now(
-                                    timezone.utc
-                                ).isoformat(),
-                                "response": content,
-                                "done": False,
-                            })
-                            self.wfile.write(out.encode() + b"\n")
-                            self.wfile.flush()
-                    except json.JSONDecodeError:
-                        pass
+                except json.JSONDecodeError:
+                    pass
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def _ollama_nonstream_generate(self, resp, model_name: str):
-        """Convert OpenAI response to Ollama generate format."""
+        return prompt_tokens, completion_tokens, cached_tokens
+
+    def _ollama_nonstream_generate(self, resp, model_name: str) -> tuple[int, int, int]:
+        """Convert OpenAI response to Ollama generate format. Returns (prompt, completion, cached) tokens."""
         data = json.loads(resp.read())
         content = ""
         if data.get("choices"):
-            content = data["choices"][0].get("message", {}).get(
-                "content", ""
-            )
+            content = data["choices"][0].get("message", {}).get("content", "")
+        usage = data.get("usage", {})
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        cached_tokens = (
+            (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+        )
         ollama_resp = {
             "model": model_name,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "response": content,
             "done": True,
+            "prompt_eval_count": prompt_tokens,
+            "eval_count": completion_tokens,
         }
         self._json(200, ollama_resp)
+        return prompt_tokens, completion_tokens, cached_tokens
 
     def _ollama_show(self):
         """POST /api/show — model info in Ollama format."""

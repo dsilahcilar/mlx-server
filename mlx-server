@@ -538,6 +538,181 @@ print(f'Showing {len(requests)} most recent. ~ = streaming request')
 " <<< "${resp}"
 }
 
+cmd_chat() {
+  local model=""
+  local no_think=false
+  local message=""
+
+  while [[ $# -gt 0 ]]; do
+    case "${1}" in
+      --model|-m)   model="${2}"; shift 2 ;;
+      --model=*)    model="${1#*=}"; shift ;;
+      --no-think)   no_think=true; shift ;;
+      -*)           echo "Unknown option: ${1}"; echo ""; echo "Usage: mlx-server chat [--model <model>] [--no-think] \"<message>\""; exit 1 ;;
+      *)            message="${1}"; shift ;;
+    esac
+  done
+
+  if [[ -z "${message}" ]]; then
+    echo "Usage: mlx-server chat [--model <model>] [--no-think] \"<message>\""
+    echo ""
+    echo "Examples:"
+    echo "  mlx-server chat \"What is the capital of France?\""
+    echo "  mlx-server chat --model mlx-community/Qwen3-8B-4bit \"Explain quantum computing\""
+    echo "  mlx-server chat --no-think \"Quick answer: 2+2?\""
+    exit 1
+  fi
+
+  _ensure_gateway
+
+  # If no model specified, use the first ready LLM
+  if [[ -z "${model}" ]]; then
+    local ps_resp
+    ps_resp=$(_api GET "/_/ps") || { echo "Could not reach gateway."; exit 1; }
+    model=$(python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+for m in data.get('models', []):
+    if m.get('ready') and m.get('type', 'llm') == 'llm':
+        print(m['model'])
+        sys.exit(0)
+sys.exit(1)
+" <<< "${ps_resp}" 2>/dev/null) || {
+      echo "No model loaded. Specify one with --model:"
+      echo "  mlx-server chat --model mlx-community/Qwen3-8B-4bit \"${message}\""
+      echo ""
+      echo "Available models:"
+      cmd_list
+      exit 1
+    }
+  fi
+
+  # Auto-pull if not cached
+  local cache_dir; cache_dir=$(_model_cache_dir "${model}")
+  if [[ ! -d "${cache_dir}" ]]; then
+    echo "Model not found locally. Pulling first..."
+    cmd_pull "${model}" || exit 1
+  fi
+
+  # Load model if not already running
+  local ps_resp
+  ps_resp=$(_api GET "/_/ps") || true
+  if ! python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+for m in data.get('models', []):
+    if m['model'] == sys.argv[1] and m.get('ready'):
+        sys.exit(0)
+sys.exit(1)
+" "${model}" <<< "${ps_resp}" 2>/dev/null; then
+    _api POST "/_/load" "{\"model\":\"${model}\"}" > /dev/null
+    echo -n "Loading ${model}"
+    local loaded=false
+    for _ in $(seq 1 200); do
+      ps_resp=$(_api GET "/_/ps") || { sleep 3; echo -n "."; continue; }
+      local failed_err
+      failed_err=$(python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+for m in data.get('models', []):
+    if m['model'] == sys.argv[1] and m.get('failed'):
+        print(m.get('error', 'Unknown error'))
+        sys.exit(0)
+sys.exit(1)
+" "${model}" <<< "${ps_resp}" 2>/dev/null) && {
+        echo ""
+        echo "❌ Failed to load ${model}: ${failed_err}" >&2
+        exit 1
+      }
+      if python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+for m in data.get('models', []):
+    if m['model'] == sys.argv[1] and m.get('ready'):
+        sys.exit(0)
+sys.exit(1)
+" "${model}" <<< "${ps_resp}" 2>/dev/null; then
+        echo ""
+        loaded=true
+        break
+      fi
+      sleep 3; echo -n "."
+    done
+    [[ "${loaded}" == false ]] && { echo ""; echo "❌ Timed out loading model." >&2; exit 1; }
+  fi
+
+  # Optionally prefix message to disable thinking (Qwen3 style)
+  local final_message="${message}"
+  [[ "${no_think}" == true ]] && final_message="/no_think ${message}"
+
+  # Stream the response
+  python3 - "${GATEWAY_URL}" "${model}" "${final_message}" << 'PYEOF'
+import sys, json, urllib.request, urllib.error
+
+base_url, model, message = sys.argv[1], sys.argv[2], sys.argv[3]
+body = json.dumps({
+    "model": model,
+    "messages": [{"role": "user", "content": message}],
+    "stream": True,
+    "stream_options": {"include_usage": True},
+}).encode()
+
+req = urllib.request.Request(
+    f"{base_url}/v1/chat/completions",
+    data=body,
+    headers={"Content-Type": "application/json", "Content-Length": str(len(body))},
+)
+
+in_thinking = False
+try:
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        for raw_line in resp:
+            line = raw_line.decode().strip()
+            if not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            if data_str == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data_str)
+                if not chunk.get("choices"):
+                    continue
+                delta = chunk["choices"][0].get("delta", {})
+                reasoning = delta.get("reasoning_content", "")
+                content = delta.get("content", "")
+                if reasoning:
+                    if not in_thinking:
+                        sys.stdout.write("\033[2m")  # dim
+                        sys.stdout.flush()
+                        in_thinking = True
+                    sys.stdout.write(reasoning)
+                    sys.stdout.flush()
+                elif content:
+                    if in_thinking:
+                        sys.stdout.write("\033[0m\n")  # reset + newline after thinking
+                        sys.stdout.flush()
+                        in_thinking = False
+                    sys.stdout.write(content)
+                    sys.stdout.flush()
+            except json.JSONDecodeError:
+                pass
+except KeyboardInterrupt:
+    pass
+except urllib.error.HTTPError as e:
+    body = e.read().decode()
+    try:
+        err = json.loads(body)
+        print(f"\n\033[31mError: {err.get('error', body)}\033[0m", file=sys.stderr)
+    except Exception:
+        print(f"\n\033[31mError ({e.code}): {body}\033[0m", file=sys.stderr)
+    sys.exit(1)
+
+if in_thinking:
+    sys.stdout.write("\033[0m")
+print()
+PYEOF
+}
+
 cmd_shutdown() {
   local pid
   pid=$(_gateway_pid) || { echo "mlx-server is not running."; return 0; }
@@ -563,6 +738,7 @@ Server:
 
 Models:
   run <model>                   Load a model and start interactive chat
+  chat [--model <m>] "<msg>"   Send a single message and get a response
   stop <model>                  Unload a model from memory
   pull <model>                  Download a model from HuggingFace
   rm <model>                    Delete a downloaded model
@@ -584,6 +760,9 @@ Examples:
   mlx-server pull mlx-community/Qwen3-32B-4bit
   mlx-server run mlx-community/Qwen3-32B-4bit
   mlx-server run mlx-community/Qwen3-8B-4bit
+  mlx-server chat "What is the capital of France?"
+  mlx-server chat --model mlx-community/Qwen3-8B-4bit "Explain recursion"
+  mlx-server chat --no-think "Quick: 2+2?"
   mlx-server ps
   mlx-server stop mlx-community/Qwen3-8B-4bit
   mlx-server search llama
@@ -600,6 +779,7 @@ EOF
 case "${1:-}" in
   serve)      shift; cmd_serve "$@" ;;
   run)        shift; cmd_run "$@" ;;
+  chat)       shift; cmd_chat "$@" ;;
   stop)       shift; cmd_stop "$@" ;;
   pull)       shift; cmd_pull "$@" ;;
   rm|remove)  shift; cmd_rm "$@" ;;

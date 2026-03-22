@@ -647,12 +647,18 @@ sys.exit(1)
 
   # Stream the response
   python3 - "${GATEWAY_URL}" "${model}" "${final_message}" << 'PYEOF'
-import sys, json, urllib.request, urllib.error
+import sys, json, urllib.request, urllib.error, uuid
 
 base_url, model, message = sys.argv[1], sys.argv[2], sys.argv[3]
+# A unique system message changes the token-sequence prefix so the backend's
+# trie KV-cache never finds a match from a previous unrelated request, which
+# would otherwise cause context bleed ("history" appearing in fresh replies).
 body = json.dumps({
     "model": model,
-    "messages": [{"role": "user", "content": message}],
+    "messages": [
+        {"role": "system", "content": f"id:{uuid.uuid4().hex[:12]}"},
+        {"role": "user", "content": message},
+    ],
     "stream": True,
     "stream_options": {"include_usage": True},
 }).encode()

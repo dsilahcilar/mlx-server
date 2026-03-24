@@ -10,13 +10,7 @@ import urllib.request
 def chat_repl(base_url: str, model: str):
     """Run an interactive multi-turn chat session with streaming output."""
     messages: list[dict] = [
-        {
-            "role": "system",
-            "content": (
-                "/no_think\n"
-                "You are a helpful assistant. Respond in clear, natural language."
-            ),
-        },
+        {"role": "system", "content": "You are a helpful assistant. Respond in clear, natural language."},
     ]
     print(f"Running {model}. Send a message or type /bye to exit.\n")
 

@@ -6,7 +6,7 @@ An Ollama-style CLI for running LLMs locally on Apple Silicon via [MLX](https://
 
 ## Requirements
 
-- Apple Silicon Mac (M1/M2/M3/M4)
+- All Apple Silicon Macs
 - Python 3.10+
 - `mlx-lm`: `pipx install mlx-lm`
 

@@ -492,6 +492,8 @@ cmd_requests() {
     local req_log="${MLX_HOME}/requests.jsonl"
     [[ -f "${req_log}" ]] || { echo "No request log found."; exit 1; }
     echo "Recent requests (from log file):"
+    echo "Legend: PT = Prompt Tokens  CT = Completion Tokens  MS = Latency (ms)"
+    echo ""
     tail -20 "${req_log}" | python3 -c "
 import json, sys
 for line in sys.stdin:
@@ -519,6 +521,8 @@ if not requests:
     print('No requests recorded yet.')
     sys.exit(0)
 
+print('Legend: PT = Prompt Tokens  CT = Completion Tokens  CACHED = Cached Tokens  MS = Latency (ms)')
+print()
 print(f\"{'TIME':>8}  {'MODEL':<40}  {'PT':>6}  {'CT':>6}  {'CACHED':>6}  {'MS':>7}  STATUS\")
 print(f\"{'-'*8}  {'-'*40}  {'-'*6}  {'-'*6}  {'-'*6}  {'-'*7}  {'-'*6}\")
 

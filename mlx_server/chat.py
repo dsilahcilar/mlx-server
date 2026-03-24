@@ -50,14 +50,16 @@ def chat_repl(base_url: str, model: str):
                 if line.startswith("data: ") and line != "data: [DONE]":
                     try:
                         chunk = json.loads(line[6:])
-                        content = (
-                            chunk.get("choices", [{}])[0]
-                            .get("delta", {})
-                            .get("content", "")
-                        )
-                        sys.stdout.write(content)
-                        sys.stdout.flush()
-                        full_response += content
+                        choices = chunk.get("choices") or []
+                        if choices:
+                            content = (
+                                choices[0]
+                                .get("delta", {})
+                                .get("content", "")
+                            )
+                            sys.stdout.write(content)
+                            sys.stdout.flush()
+                            full_response += content
                     except json.JSONDecodeError:
                         pass
             print("\n")

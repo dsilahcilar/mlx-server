@@ -257,3 +257,7 @@ mlx_server/
 - Chain-of-thought (thinking) disabled by default for cleaner output
 - Max tokens default: 4096 per response
 - Request log persisted to `~/.mlx/requests.jsonl` (last 1000 entries kept in memory)
+
+## CLI Usage
+
+![mlx-server CLI usage screenshot](assets/mlx-usage.jpeg)

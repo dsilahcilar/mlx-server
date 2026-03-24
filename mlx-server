@@ -89,6 +89,18 @@ cmd_serve() {
     return 0
   fi
 
+  # If something is already answering on the port (orphaned gateway from a
+  # previous session whose PID file was lost), adopt it so ps/shutdown work.
+  if curl -sf --max-time 1 "http://127.0.0.1:${port}/_/health" &>/dev/null; then
+    local orphan_pid
+    orphan_pid=$(lsof -ti tcp:"${port}" 2>/dev/null | head -1)
+    if [[ -n "${orphan_pid}" ]]; then
+      echo "${orphan_pid}" > "${MLX_HOME}/gateway.pid"
+      [[ "${quiet}" == false ]] && echo "mlx-server is already running (PID ${orphan_pid}) on ${GATEWAY_URL}"
+      return 0
+    fi
+  fi
+
   [[ "${quiet}" == false ]] && echo "Starting mlx-server on port ${port}..."
 
   nohup python3 "${GATEWAY_SCRIPT}" --port "${port}" \
@@ -100,6 +112,15 @@ cmd_serve() {
   [[ "${quiet}" == false ]] && echo -n "Waiting"
   for _ in $(seq 1 30); do
     if curl -sf --max-time 1 "http://127.0.0.1:${port}/_/health" &>/dev/null; then
+      # Verify the gateway wrote a PID file (it does so after binding the port).
+      # If it didn't, the above health check passed because an orphaned process
+      # on the port answered — surface an actionable error instead of succeeding silently.
+      if ! _gateway_pid &>/dev/null; then
+        echo ""
+        echo "❌ Gateway failed to bind port ${port} (already in use by another process)." >&2
+        echo "   Run: mlx-server shutdown   to clear all running processes, then retry." >&2
+        exit 1
+      fi
       [[ "${quiet}" == false ]] && echo ""
       [[ "${quiet}" == false ]] && echo "✅ mlx-server running on http://127.0.0.1:${port}"
       [[ "${quiet}" == false ]] && echo ""

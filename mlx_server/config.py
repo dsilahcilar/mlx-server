@@ -14,3 +14,4 @@ HF_CACHE = Path(os.environ.get(
     "HF_HOME", str(Path.home() / ".cache" / "huggingface")
 )) / "hub"
 REQUEST_LOG_FILE = MLX_HOME / "requests.jsonl"
+BACKEND_PID_DIR = MLX_HOME / "backends"

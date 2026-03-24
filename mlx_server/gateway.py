@@ -84,9 +84,16 @@ def serve(port: int = DEFAULT_PORT):
     MLX_HOME.mkdir(parents=True, exist_ok=True)
 
     pid_file = MLX_HOME / "gateway.pid"
-    pid_file.write_text(str(os.getpid()))
 
-    server = ThreadedServer(("0.0.0.0", port), GatewayHandler)
+    try:
+        server = ThreadedServer(("0.0.0.0", port), GatewayHandler)
+    except OSError as exc:
+        print(f"❌ Cannot start gateway: {exc}", flush=True)
+        raise SystemExit(1) from exc
+
+    # Write PID only after the port is successfully bound so stale PID
+    # files from a port-collision crash are never left behind.
+    pid_file.write_text(str(os.getpid()))
 
     def _shutdown(signum, _frame):
         log.info("Received signal %d, shutting down...", signum)

@@ -9,7 +9,7 @@ import threading
 import time
 from pathlib import Path
 
-from .config import BACKEND_BASE_PORT, HF_CACHE, MAX_TOKENS_DEFAULT, MLX_HOME
+from .config import BACKEND_BASE_PORT, BACKEND_PID_DIR, HF_CACHE, MAX_TOKENS_DEFAULT, MLX_HOME
 from .models import (
     find_embedding_python,
     find_mlx_server_bin,
@@ -70,6 +70,7 @@ class ModelBackend:
             " (embedding)" if self.embedding else "",
             self.port,
         )
+        BACKEND_PID_DIR.mkdir(parents=True, exist_ok=True)
         try:
             self.process = subprocess.Popen(
                 cmd,
@@ -83,6 +84,9 @@ class ModelBackend:
             self._loading.clear()
             return False
 
+        # Record PID so cmd_shutdown can kill orphaned backends.
+        (BACKEND_PID_DIR / f"{self.port}.pid").write_text(str(self.process.pid))
+
         return self._wait_for_ready(log_path)
 
     def stop(self):
@@ -94,6 +98,9 @@ class ModelBackend:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=5)
+        # Remove PID file on clean stop.
+        pid_file = BACKEND_PID_DIR / f"{self.port}.pid"
+        pid_file.unlink(missing_ok=True)
         self.ready = False
         self._ready_event.clear()
 

@@ -747,17 +747,32 @@ PYEOF
 
 cmd_shutdown() {
   local pid
-  pid=$(_gateway_pid) || { echo "mlx-server is not running."; return 0; }
+  pid=$(_gateway_pid) || { echo "mlx-server is not running."; }
 
-  echo "Shutting down mlx-server (PID ${pid})..."
-  kill "${pid}"
+  if [[ -n "${pid}" ]]; then
+    echo "Shutting down mlx-server (PID ${pid})..."
+    kill "${pid}"
+    for _ in $(seq 1 10); do
+      kill -0 "${pid}" 2>/dev/null || break
+      sleep 1
+    done
+    echo "✅ Gateway stopped."
+  fi
 
-  # Wait for clean exit
-  for _ in $(seq 1 10); do
-    kill -0 "${pid}" 2>/dev/null || { echo "✅ Stopped."; return 0; }
-    sleep 1
-  done
-  echo "✅ Stopped."
+  # Kill any orphaned backend processes using the PID files each backend
+  # writes to ~/.mlx/backends/<port>.pid when it starts.
+  local pid_dir="${MLX_HOME}/backends"
+  if [[ -d "${pid_dir}" ]]; then
+    for pf in "${pid_dir}"/*.pid; do
+      [[ -f "${pf}" ]] || continue
+      local bpid; bpid=$(cat "${pf}" 2>/dev/null) || continue
+      if kill -0 "${bpid}" 2>/dev/null; then
+        echo "Stopping orphaned backend PID ${bpid}..."
+        kill "${bpid}" 2>/dev/null || true
+      fi
+      rm -f "${pf}"
+    done
+  fi
 }
 
 print_usage() {

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import http.client
-import json
 import logging
 import os
 import subprocess
@@ -133,7 +132,6 @@ class ModelBackend:
             "--model", self.model_id,
             "--port", str(self.port),
             "--max-tokens", str(self.max_tokens),
-            "--chat-template-args", json.dumps({"enable_thinking": False}),
         ]
 
     def _wait_for_ready(

@@ -476,7 +476,7 @@ if not models:
     print('No requests recorded yet.')
     sys.exit(0)
 
-print(f\"{'MODEL':<45}  {'REQS':>6}  {'ERRORS':>6}  {'PROMPT':>8}  {'COMPLT':>8}  {'CACHED':>8}  {'AVG MS':>8}  {'MAX MS':>8}\")
+print(f\"{'MODEL':<45}  {'REQS':>6}  {'ERRORS':>6}  {'PROMPT':>8}  {'COMPLT':>8}  {'CACHE%':>8}  {'AVG MS':>8}  {'MAX MS':>8}\")
 print(f\"{'-'*45}  {'-'*6}  {'-'*6}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}\")
 
 for model, s in sorted(models.items()):
@@ -521,10 +521,10 @@ if not requests:
     print('No requests recorded yet.')
     sys.exit(0)
 
-print('Legend: PT = Prompt Tokens  CT = Completion Tokens  CACHED = Cached Tokens  MS = Latency (ms)')
+print('Legend: PT = Prompt Tokens  CT = Completion Tokens  CACHE% = KV Cache Hit Rate  MS = Latency (ms)')
 print()
-print(f\"{'TIME':>8}  {'MODEL':<40}  {'PT':>6}  {'CT':>6}  {'CACHED':>6}  {'MS':>7}  STATUS\")
-print(f\"{'-'*8}  {'-'*40}  {'-'*6}  {'-'*6}  {'-'*6}  {'-'*7}  {'-'*6}\")
+print(f\"{'TIME':>8}  {'MODEL':<40}  {'PT':>6}  {'CT':>6}  {'CACHE%':>7}  {'MS':>7}  STATUS\")
+print(f\"{'-'*8}  {'-'*40}  {'-'*6}  {'-'*6}  {'-'*7}  {'-'*7}  {'-'*6}\")
 
 for r in requests:
     ts = r['ts'][11:19]
@@ -533,9 +533,10 @@ for r in requests:
     ct = r.get('completion_tokens', 0)
     cached = r.get('cached_tokens', 0)
     ms = r.get('latency_ms', 0)
+    cache_pct = f'{cached / pt * 100:.0f}%' if pt > 0 else '  -'
     status = '❌' if r.get('error') else '✅'
     stream = '~' if r.get('stream') else ' '
-    print(f'{ts}  {model:<40}  {pt:>6}  {ct:>6}  {cached:>6}  {ms:>7.0f}  {status}{stream}')
+    print(f'{ts}  {model:<40}  {pt:>6}  {ct:>6}  {cache_pct:>7}  {ms:>7.0f}  {status}{stream}')
 
 print()
 print(f'Showing {len(requests)} most recent. ~ = streaming request')

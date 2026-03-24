@@ -481,7 +481,7 @@ print(f\"{'-'*45}  {'-'*6}  {'-'*6}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}
 
 for model, s in sorted(models.items()):
     name = model[-45:] if len(model) > 45 else model
-    cache_pct = f\"{100*s['cached_tokens']//s['prompt_tokens']}%\" if s['prompt_tokens'] > 0 else '-'
+    cache_pct = f\"{100*s['cached_tokens']/s['prompt_tokens']:.1f}%\" if s['prompt_tokens'] > 0 else '-'
     print(f'{name:<45}  {s[\"requests\"]:>6}  {s[\"errors\"]:>6}  {s[\"prompt_tokens\"]:>8}  {s[\"completion_tokens\"]:>8}  {cache_pct:>8}  {s[\"latency_avg_ms\"]:>8.0f}  {s[\"latency_max_ms\"]:>8.0f}')
 " <<< "${resp}"
 }
@@ -515,7 +515,7 @@ for r in rows:
     ct = r.get('completion_tokens', 0)
     cached = r.get('cached_tokens', 0)
     ms = r.get('latency_ms', 0)
-    cache_pct = f'{cached / pt * 100:.0f}%' if pt > 0 else '  -'
+    cache_pct = f'{cached / pt * 100:.1f}%' if pt > 0 else '  -'
     status = '❌' if r.get('error') else '✅'
     stream = '~' if r.get('stream') else ' '
     print(f'{ts}  {model:<40}  {pt:>6}  {ct:>6}  {cache_pct:>7}  {ms:>7.0f}  {status}{stream}')
@@ -552,7 +552,7 @@ for r in requests:
     ct = r.get('completion_tokens', 0)
     cached = r.get('cached_tokens', 0)
     ms = r.get('latency_ms', 0)
-    cache_pct = f'{cached / pt * 100:.0f}%' if pt > 0 else '  -'
+    cache_pct = f'{cached / pt * 100:.1f}%' if pt > 0 else '  -'
     status = '❌' if r.get('error') else '✅'
     stream = '~' if r.get('stream') else ' '
     print(f'{ts}  {model:<40}  {pt:>6}  {ct:>6}  {cache_pct:>7}  {ms:>7.0f}  {status}{stream}')

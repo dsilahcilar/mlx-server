@@ -491,18 +491,37 @@ cmd_requests() {
     # Fall back to reading log file
     local req_log="${MLX_HOME}/requests.jsonl"
     [[ -f "${req_log}" ]] || { echo "No request log found."; exit 1; }
+    local n="${1:-20}"
     echo "Recent requests (from log file):"
-    echo "Legend: PT = Prompt Tokens  CT = Completion Tokens  MS = Latency (ms)"
-    echo ""
-    tail -20 "${req_log}" | python3 -c "
+    tail -"${n}" "${req_log}" | python3 -c "
 import json, sys
+
+print('Legend: PT = Prompt Tokens  CT = Completion Tokens  CACHE% = KV Cache Hit Rate  MS = Latency (ms)')
+print()
+print(f\"{'TIME':>8}  {'MODEL':<40}  {'PT':>6}  {'CT':>6}  {'CACHE%':>7}  {'MS':>7}  STATUS\")
+print(f\"{'-'*8}  {'-'*40}  {'-'*6}  {'-'*6}  {'-'*7}  {'-'*7}  {'-'*6}\")
+
+rows = []
 for line in sys.stdin:
     try:
-        r = json.loads(line)
-        ts = r['ts'][11:19]
-        print(f\"{ts}  {r['model']:<45}  {r.get('prompt_tokens',0):>6}pt  {r.get('completion_tokens',0):>6}ct  {r.get('latency_ms',0):>7.0f}ms  {'ERR' if r.get('error') else 'OK'}\")
+        rows.append(json.loads(line))
     except Exception:
         pass
+
+for r in rows:
+    ts = r['ts'][11:19]
+    model = r['model'][-40:]
+    pt = r.get('prompt_tokens', 0)
+    ct = r.get('completion_tokens', 0)
+    cached = r.get('cached_tokens', 0)
+    ms = r.get('latency_ms', 0)
+    cache_pct = f'{cached / pt * 100:.0f}%' if pt > 0 else '  -'
+    status = '❌' if r.get('error') else '✅'
+    stream = '~' if r.get('stream') else ' '
+    print(f'{ts}  {model:<40}  {pt:>6}  {ct:>6}  {cache_pct:>7}  {ms:>7.0f}  {status}{stream}')
+
+print()
+print(f'Showing {len(rows)} most recent. ~ = streaming request')
 "
     return 0
   fi

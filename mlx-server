@@ -496,7 +496,7 @@ cmd_requests() {
     tail -"${n}" "${req_log}" | python3 -c "
 import json, sys
 
-print('Legend: PT = Prompt Tokens  CT = Completion Tokens  CACHE% = KV Cache Hit Rate  MS = Latency (ms)')
+print('Legend: PT = Prompt Tokens  CT = Completion Tokens  CACHE% = KV Cache Hit Rate (incl. system prompt; high values are normal)  MS = Latency (ms)')
 print()
 print(f\"{'TIME':>8}  {'MODEL':<40}  {'PT':>6}  {'CT':>6}  {'CACHE%':>7}  {'MS':>7}  STATUS\")
 print(f\"{'-'*8}  {'-'*40}  {'-'*6}  {'-'*6}  {'-'*7}  {'-'*7}  {'-'*6}\")
@@ -540,7 +540,7 @@ if not requests:
     print('No requests recorded yet.')
     sys.exit(0)
 
-print('Legend: PT = Prompt Tokens  CT = Completion Tokens  CACHE% = KV Cache Hit Rate  MS = Latency (ms)')
+print('Legend: PT = Prompt Tokens  CT = Completion Tokens  CACHE% = KV Cache Hit Rate (incl. system prompt; high values are normal)  MS = Latency (ms)')
 print()
 print(f\"{'TIME':>8}  {'MODEL':<40}  {'PT':>6}  {'CT':>6}  {'CACHE%':>7}  {'MS':>7}  STATUS\")
 print(f\"{'-'*8}  {'-'*40}  {'-'*6}  {'-'*6}  {'-'*7}  {'-'*7}  {'-'*6}\")

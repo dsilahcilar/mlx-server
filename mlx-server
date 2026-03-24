@@ -189,8 +189,10 @@ print('llm')
         echo "    -H 'Content-Type: application/json' \\"
         echo "    -d '{\"model\":\"${model}\",\"input\":\"Your text here\"}'"
       else
-        # Start interactive chat
-        python3 "${GATEWAY_SCRIPT}" chat "${GATEWAY_URL}" "${model}"
+        # Start interactive chat.
+        # Redirect stdin from /dev/tty so Python's input() reads directly from
+        # the terminal and does not consume bytes from bash's script file descriptor.
+        python3 "${GATEWAY_SCRIPT}" chat "${GATEWAY_URL}" "${model}" < /dev/tty
       fi
       return 0
     fi

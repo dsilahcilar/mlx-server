@@ -6,7 +6,7 @@ from pathlib import Path
 
 DEFAULT_PORT = 11070
 BACKEND_BASE_PORT = 18100
-MAX_TOKENS_DEFAULT = 4096
+MAX_TOKENS_DEFAULT = 16384  # Increased for larger JSON outputs (propositions extraction)
 REQUEST_LOG_MAX = 1000  # keep last N requests in memory
 
 MLX_HOME = Path.home() / ".mlx"

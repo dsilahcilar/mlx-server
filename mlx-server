@@ -518,6 +518,7 @@ cmd_requests() {
     echo "Recent requests (from log file):"
     tail -"${n}" "${req_log}" | python3 -c "
 import json, sys
+from datetime import datetime, timezone
 
 print('Legend: PT = Prompt Tokens  CT = Completion Tokens  CACHE% = KV Cache Hit Rate (incl. system prompt; high values are normal)  MS = Latency (ms)')
 print()
@@ -532,7 +533,7 @@ for line in sys.stdin:
         pass
 
 for r in rows:
-    ts = r['ts'][11:19]
+    ts = datetime.fromisoformat(r['ts']).astimezone().strftime('%H:%M:%S')
     model = r['model'][-40:]
     pt = r.get('prompt_tokens', 0)
     ct = r.get('completion_tokens', 0)
@@ -555,6 +556,7 @@ print(f'Showing {len(rows)} most recent. ~ = streaming request')
 
   python3 -c "
 import json, sys
+from datetime import datetime, timezone
 
 data = json.loads(sys.stdin.read())
 requests = data.get('requests', [])
@@ -569,7 +571,7 @@ print(f\"{'TIME':>8}  {'MODEL':<40}  {'PT':>6}  {'CT':>6}  {'CACHE%':>7}  {'MS':
 print(f\"{'-'*8}  {'-'*40}  {'-'*6}  {'-'*6}  {'-'*7}  {'-'*7}  {'-'*6}\")
 
 for r in requests:
-    ts = r['ts'][11:19]
+    ts = datetime.fromisoformat(r['ts']).astimezone().strftime('%H:%M:%S')
     model = r['model'][-40:]
     pt = r.get('prompt_tokens', 0)
     ct = r.get('completion_tokens', 0)

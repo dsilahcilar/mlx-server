@@ -10,7 +10,10 @@ import threading
 import time
 from pathlib import Path
 
-from .config import BACKEND_BASE_PORT, BACKEND_PID_DIR, HF_CACHE, MAX_TOKENS_DEFAULT, MLX_HOME
+from .config import (
+    BACKEND_BASE_PORT, BACKEND_PID_DIR, HF_CACHE, IDLE_TIMEOUT_SECONDS,
+    MAX_TOKENS_DEFAULT, MLX_HOME, PROMPT_CACHE_SIZE,
+)
 from .models import (
     find_embedding_python,
     find_mlx_server_bin,
@@ -141,6 +144,7 @@ class ModelBackend:
             "--port", str(self.port),
             "--max-tokens", str(self.max_tokens),
             "--chat-template-args", json.dumps({"enable_thinking": False}),
+            "--prompt-cache-size", str(PROMPT_CACHE_SIZE),
         ]
 
     def _wait_for_ready(
@@ -214,6 +218,29 @@ class BackendManager:
         self.backends: dict[str, ModelBackend] = {}
         self._next_port = BACKEND_BASE_PORT
         self._lock = threading.Lock()
+        if IDLE_TIMEOUT_SECONDS > 0:
+            t = threading.Thread(target=self._eviction_loop, daemon=True)
+            t.start()
+
+    def _eviction_loop(self):
+        """Periodically stop backends that have been idle too long."""
+        while True:
+            time.sleep(60)
+            now = time.time()
+            to_evict = []
+            with self._lock:
+                for model_id, b in list(self.backends.items()):
+                    if b.ready and (now - b.last_used) > IDLE_TIMEOUT_SECONDS:
+                        to_evict.append((model_id, b))
+                for model_id, _ in to_evict:
+                    del self.backends[model_id]
+            for model_id, b in to_evict:
+                idle_min = int((now - b.last_used) / 60)
+                log.info(
+                    "Evicting idle backend %s (idle %d min > limit %d min)",
+                    model_id, idle_min, IDLE_TIMEOUT_SECONDS // 60,
+                )
+                b.stop()
 
     def get_or_start(
         self, model_id: str
